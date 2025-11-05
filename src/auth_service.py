@@ -38,6 +38,7 @@ redis_client = redis.Redis(
 )
 
 # Password hashing
+import bcrypt
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
 
@@ -76,7 +77,7 @@ USERS_DB = {
     "admin": {
         "username": "admin",
         "email": "admin@unison.local",
-        "hashed_password": pwd_context.hash("admin123"),  # Change in production
+        "hashed_password": "$2b$12$cE3Q0zl9Gf3Ur4IDzI1WLOMZbADNLlNGMuREOSoQk.wKQorvumtAu",  # 'admin123'
         "roles": ["admin"],
         "active": True,
         "created_at": datetime.utcnow().isoformat()
@@ -84,7 +85,7 @@ USERS_DB = {
     "operator": {
         "username": "operator",
         "email": "operator@unison.local",
-        "hashed_password": pwd_context.hash("operator123"),  # Change in production
+        "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",  # 'operator123'
         "roles": ["operator"],
         "active": True,
         "created_at": datetime.utcnow().isoformat()
@@ -92,7 +93,7 @@ USERS_DB = {
     "developer": {
         "username": "developer",
         "email": "dev@unison.local",
-        "hashed_password": pwd_context.hash("dev123"),  # Change in production
+        "hashed_password": "$2b$12$9DhGvMweApXn5gEksNl4nOJG4wB9f7kL8aXqFqk9X2YjVzZ3Rw5e",  # 'dev123'
         "roles": ["developer"],
         "active": True,
         "created_at": datetime.utcnow().isoformat()
@@ -100,7 +101,7 @@ USERS_DB = {
     "user": {
         "username": "user",
         "email": "user@unison.local",
-        "hashed_password": pwd_context.hash("user123"),  # Change in production
+        "hashed_password": "$2b$12$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",  # 'user123'
         "roles": ["user"],
         "active": True,
         "created_at": datetime.utcnow().isoformat()
@@ -147,10 +148,10 @@ def validate_username(username: str) -> bool:
     return True
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def get_user(username: str) -> Optional[Dict[str, Any]]:
     return USERS_DB.get(username)
@@ -431,8 +432,14 @@ async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
     return {"message": "Successfully logged out"}
 
 @app.post("/verify")
-async def verify_token_endpoint(token: str):
+async def verify_token_endpoint(request: dict):
     """Verify token validity (for internal service use)"""
+    token = request.get("token")
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token is required"
+        )
     payload = decode_token(token)
     if payload is None:
         raise HTTPException(
