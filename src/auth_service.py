@@ -11,6 +11,10 @@ from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, EmailStr
 import logging
 
+# P0.1: Import RSA key manager and JWKS router
+from .crypto import get_key_manager
+from .jwks import router as jwks_router
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,11 +25,17 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# P0.1: Include JWKS router for public key distribution
+app.include_router(jwks_router, tags=["jwks"])
+
 # Configuration
-SECRET_KEY = os.getenv("UNISON_JWT_SECRET", "change-this-secret-key-in-production-256-bits-minimum")
-ALGORITHM = "HS256"
+# P0.1: Removed SECRET_KEY and HS256 - now using RS256 with RSA keys
+ALGORITHM = "RS256"  # Changed from HS256 to RS256
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("UNISON_ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 REFRESH_TOKEN_EXPIRE_MINUTES = int(os.getenv("UNISON_REFRESH_TOKEN_EXPIRE_MINUTES", "1440"))  # 24 hours
+
+# P0.1: Initialize RSA key manager
+key_manager = get_key_manager()
 
 # Redis for token blacklist and session storage
 redis_client = redis.Redis(
@@ -197,7 +207,8 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
         "jti": f"access_{int(time.time())}_{data.get('sub', 'unknown')}"
     })
     
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    # P0.1: Use RSA key manager to sign with RS256
+    encoded_jwt = key_manager.sign_token(to_encode)
     return encoded_jwt
 
 def create_refresh_token(data: dict) -> str:
@@ -211,7 +222,8 @@ def create_refresh_token(data: dict) -> str:
         "jti": f"refresh_{int(time.time())}_{data.get('sub', 'unknown')}"
     })
     
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    # P0.1: Use RSA key manager to sign with RS256
+    encoded_jwt = key_manager.sign_token(to_encode)
     return encoded_jwt
 
 def is_token_blacklisted(jti: str) -> bool:
@@ -233,7 +245,8 @@ def blacklist_token(jti: str, exp: int):
 
 def decode_token(token: str) -> Optional[Dict[str, Any]]:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        # P0.1: Use RSA key manager to verify with RS256
+        payload = key_manager.verify_token(token)
         return payload
     except JWTError as e:
         logger.warning(f"Token decode error: {e}")
@@ -532,9 +545,20 @@ async def create_user(
         "active": True
     }
 
+@app.get("/healthz", response_model=HealthResponse)
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint"""
+    """Liveness check - is the service alive?"""
+    return {
+        "status": "ok",
+        "service": "unison-auth",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/readyz")
+@app.get("/ready")
+async def readiness_check():
+    """Readiness check - is the service ready to serve traffic?"""
     redis_connected = False
     try:
         redis_client.ping()
@@ -542,11 +566,19 @@ async def health_check():
     except redis.ConnectionError:
         pass
     
+    if not redis_connected:
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready - Redis unavailable"
+        )
+    
     return {
-        "status": "ok",
+        "status": "ready",
         "service": "unison-auth",
         "timestamp": datetime.utcnow().isoformat(),
-        "redis_connected": redis_connected
+        "dependencies": {
+            "redis": "connected"
+        }
     }
 
 @app.get("/")
