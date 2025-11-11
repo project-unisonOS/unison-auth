@@ -15,6 +15,7 @@ jobs:
       OTEL_METRICS_EXPORTER: none
       OTEL_LOGS_EXPORTER: none
       OTEL_EXPORTER_OTLP_ENDPOINT: ""
+      UNISON_AUTH_KEYS_DIR: "${{ github.workspace }}/.keys"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,6 +30,9 @@ jobs:
           python -m pip install "git+https://github.com/project-unisonOS/unison-common.git@main"
           python -m pip install -r requirements.txt
           python -m pip install pytest pytest-asyncio pytest-rerunfailures
+      - name: Prepare writable keys dir
+        run: |
+          mkdir -p "${{ github.workspace }}/.keys"
       - name: Run tests
         run: |
           pytest -q --maxfail=1 --durations=15 --reruns 1
