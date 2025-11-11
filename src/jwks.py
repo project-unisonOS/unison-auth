@@ -2,7 +2,7 @@
 JWKS (JSON Web Key Set) endpoint for public key distribution (P0.1)
 """
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Response, Request
 from typing import Dict
 import logging
 
@@ -14,7 +14,7 @@ router = APIRouter()
 
 
 @router.get("/jwks.json")
-async def get_jwks(response: Response) -> Dict:
+async def get_jwks(request: Request, response: Response) -> Dict:
     """
     Get JWKS (JSON Web Key Set) for public key distribution.
     
@@ -26,10 +26,20 @@ async def get_jwks(response: Response) -> Dict:
     try:
         key_manager = get_key_manager()
         jwks = key_manager.get_jwks()
+        # Compute weak ETag based on current kid and number of keys
+        current_kid = key_manager.get_current_kid() or "unknown"
+        etag_value = f'W/"{current_kid}-{len(jwks.get("keys", []))}"'
+
+        # If-None-Match handling
+        inm = request.headers.get("if-none-match")
+        if inm and inm == etag_value:
+            response.status_code = 304
+            return {}
         
         # Set cache headers (5 minutes)
         response.headers["Cache-Control"] = "public, max-age=300"
         response.headers["Content-Type"] = "application/json"
+        response.headers["ETag"] = etag_value
         
         logger.debug(f"Serving JWKS with {len(jwks['keys'])} keys")
         
@@ -41,13 +51,13 @@ async def get_jwks(response: Response) -> Dict:
 
 
 @router.get("/.well-known/jwks.json")
-async def get_jwks_well_known(response: Response) -> Dict:
+async def get_jwks_well_known(request: Request, response: Response) -> Dict:
     """
     Well-known JWKS endpoint (alternative standard location).
     
     Same as /jwks.json but at the standard .well-known location.
     """
-    return await get_jwks(response)
+    return await get_jwks(request, response)
 
 
 @router.get("/keys")
