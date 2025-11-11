@@ -14,6 +14,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
 from jose import jwt, JWTError
 import json
+import threading
+import time
+import schedule
 
 logger = logging.getLogger(__name__)
 
@@ -26,25 +29,30 @@ class RSAKeyManager:
     def __init__(
         self,
         keys_dir: str = "/app/keys",
-        rotation_interval_hours: int = 720  # 30 days default
+        rotation_interval_hours: int = 24  # 24 hours for daily rotation
     ):
         """
         Initialize RSA key manager.
         
         Args:
             keys_dir: Directory containing RSA key files
-            rotation_interval_hours: Hours between key rotations
+            rotation_interval_hours: Hours between key rotations (24 for daily)
         """
         self.keys_dir = Path(keys_dir)
         self.rotation_interval = timedelta(hours=rotation_interval_hours)
         self.keys: Dict[str, Dict] = {}
         self.current_kid: Optional[str] = None
+        self._rotation_thread: Optional[threading.Thread] = None
+        self._stop_rotation = threading.Event()
         
         # Ensure keys directory exists
         self.keys_dir.mkdir(parents=True, exist_ok=True)
         
         # Load existing keys
         self._load_keys()
+        
+        # Start rotation scheduler
+        self._start_rotation_scheduler()
     
     def _load_keys(self):
         """Load all RSA key pairs from keys directory"""
@@ -91,6 +99,72 @@ class RSAKeyManager:
                 logger.warning("No active keys found")
         else:
             logger.warning("No keys loaded, will need to generate")
+    
+    def _start_rotation_scheduler(self):
+        """Start the background rotation scheduler"""
+        if self._rotation_thread is None or not self._rotation_thread.is_alive():
+            self._stop_rotation.clear()
+            self._rotation_thread = threading.Thread(target=self._rotation_worker, daemon=True)
+            self._rotation_thread.start()
+            logger.info("Key rotation scheduler started")
+    
+    def _rotation_worker(self):
+        """Background worker for scheduled key rotation"""
+        # Schedule daily rotation at 2 AM UTC
+        schedule.every().day.at("02:00").do(self._scheduled_rotation)
+        
+        while not self._stop_rotation.is_set():
+            schedule.run_pending()
+            time.sleep(60)  # Check every minute
+    
+    def _scheduled_rotation(self):
+        """Scheduled key rotation task"""
+        try:
+            logger.info("Starting scheduled key rotation")
+            new_kid = self.rotate_keys()
+            
+            # Clean up old keys (older than 7 days and not current)
+            self._cleanup_old_keys()
+            
+            logger.info(f"Scheduled rotation completed: new kid={new_kid}")
+        except Exception as e:
+            logger.error(f"Scheduled key rotation failed: {e}")
+    
+    def _cleanup_old_keys(self):
+        """Remove keys older than grace period (7 days) that are not current"""
+        grace_period = timedelta(days=7)
+        cutoff_time = datetime.utcnow() - grace_period
+        
+        for kid in list(self.keys.keys()):
+            if kid == self.current_kid:
+                continue  # Never remove current key
+            
+            key_info = self.keys[kid]
+            created_at = datetime.fromisoformat(key_info["created_at"])
+            
+            if created_at < cutoff_time and not key_info["active"]:
+                logger.info(f"Removing old key: {kid}")
+                self._remove_key_files(kid)
+                del self.keys[kid]
+    
+    def _remove_key_files(self, kid: str):
+        """Remove all files associated with a key"""
+        files_to_remove = [
+            self.keys_dir / f"{kid}_private.pem",
+            self.keys_dir / f"{kid}_public.pem",
+            self.keys_dir / f"{kid}_metadata.json"
+        ]
+        
+        for file_path in files_to_remove:
+            if file_path.exists():
+                file_path.unlink()
+    
+    def stop_rotation(self):
+        """Stop the rotation scheduler"""
+        self._stop_rotation.set()
+        if self._rotation_thread and self._rotation_thread.is_alive():
+            self._rotation_thread.join(timeout=5)
+        logger.info("Key rotation scheduler stopped")
     
     def _load_key_pair(self, kid: str) -> Tuple:
         """Load a specific key pair"""
@@ -361,7 +435,7 @@ def get_key_manager() -> RSAKeyManager:
     global _key_manager
     if _key_manager is None:
         keys_dir = os.getenv("UNISON_AUTH_KEYS_DIR", "/app/keys")
-        rotation_hours = int(os.getenv("UNISON_AUTH_KEY_ROTATION_HOURS", "720"))
+        rotation_hours = int(os.getenv("UNISON_AUTH_KEY_ROTATION_HOURS", "24"))  # Daily rotation
         _key_manager = RSAKeyManager(keys_dir, rotation_hours)
         
         # Generate initial key if none exist

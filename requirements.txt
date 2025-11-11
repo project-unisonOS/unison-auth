@@ -5,7 +5,7 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.6
 redis==5.0.1
 httpx==0.27.2
-pydantic==2.5.0
+pydantic==2.9.2
 python-dotenv==1.0.0
 
 # Needed for EmailStr in Pydantic models
@@ -13,6 +13,9 @@ email-validator==2.1.0.post1
 
 # P0.1: RSA key management for RS256 JWT signing
 cryptography==41.0.7
+
+# P0.1: Schedule for daily key rotation
+schedule==1.2.0
 
 # unison-common package (local install)
 ../unison-common/dist/unison_common-0.1.0-py3-none-any.whl

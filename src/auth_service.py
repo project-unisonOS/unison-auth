@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Form
+from fastapi import FastAPI, HTTPException, Depends, status, Form, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -14,9 +14,33 @@ import logging
 # P0.1: Import RSA key manager and JWKS router
 from .crypto import get_key_manager
 from .jwks import router as jwks_router
+from unison_common.tracing_middleware import TracingMiddleware
+from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+
+# /token rate limiting config
+TOKEN_RATE_LIMIT = int(os.getenv("AUTH_TOKEN_RATE_LIMIT", "10"))  # requests per window
+TOKEN_RATE_WINDOW = int(os.getenv("AUTH_TOKEN_RATE_WINDOW_SECONDS", "60"))  # seconds
+
+def _rate_limit_key(ip: str) -> str:
+    return f"rl:token:{ip}"
+
+def is_rate_limited(ip: str) -> bool:
+    """Increment counter for IP and return True if over limit within window."""
+    try:
+        key = _rate_limit_key(ip)
+        with redis_client.pipeline() as pipe:
+            pipe.incr(key, 1)
+            pipe.expire(key, TOKEN_RATE_WINDOW)
+            res = pipe.execute()
+        count = int(res[0]) if res and isinstance(res[0], (int,)) else 0
+        return count > TOKEN_RATE_LIMIT
+    except redis.ConnectionError:
+        # Fail-open on rate limit if Redis unavailable, but log warning
+        logger.warning("Redis unavailable for rate limiting; skipping limit")
+        return False
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -27,6 +51,14 @@ app = FastAPI(
 
 # P0.1: Include JWKS router for public key distribution
 app.include_router(jwks_router, tags=["jwks"])
+ 
+# P0.3: Add tracing middleware for x-request-id and traceparent propagation
+app.add_middleware(TracingMiddleware, service_name="unison-auth")
+
+# P0.3: Initialize tracing and instrument FastAPI/httpx
+initialize_tracing()
+instrument_fastapi(app)
+instrument_httpx()
 
 # Configuration
 # P0.1: Removed SECRET_KEY and HS256 - now using RS256 with RSA keys
@@ -83,56 +115,68 @@ class HealthResponse(BaseModel):
     redis_connected: bool
 
 # Mock user database (replace with real database in production)
-USERS_DB = {
-    "admin": {
-        "username": "admin",
-        "email": "admin@unison.local",
-        "hashed_password": "$2b$12$cE3Q0zl9Gf3Ur4IDzI1WLOMZbADNLlNGMuREOSoQk.wKQorvumtAu",  # 'admin123'
-        "roles": ["admin"],
-        "active": True,
-        "created_at": datetime.utcnow().isoformat()
-    },
-    "operator": {
-        "username": "operator",
-        "email": "operator@unison.local",
-        "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",  # 'operator123'
-        "roles": ["operator"],
-        "active": True,
-        "created_at": datetime.utcnow().isoformat()
-    },
-    "developer": {
-        "username": "developer",
-        "email": "dev@unison.local",
-        "hashed_password": "$2b$12$9DhGvMweApXn5gEksNl4nOJG4wB9f7kL8aXqFqk9X2YjVzZ3Rw5e",  # 'dev123'
-        "roles": ["developer"],
-        "active": True,
-        "created_at": datetime.utcnow().isoformat()
-    },
-    "user": {
-        "username": "user",
-        "email": "user@unison.local",
-        "hashed_password": "$2b$12$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",  # 'user123'
-        "roles": ["user"],
-        "active": True,
-        "created_at": datetime.utcnow().isoformat()
-    }
-}
+# In production, users should be stored in a secure database with properly hashed passwords
+def get_default_users() -> Dict[str, Dict[str, Any]]:
+    """Get default users from environment or secure configuration"""
+    users: Dict[str, Dict[str, Any]] = {}
+    # Only add default users in development mode
+    if os.getenv("UNISON_AUTH_DEV_MODE", "false").lower() == "true":
+        # Development users with weak passwords - ONLY for development
+        users.update({
+            "admin": {
+                "username": "admin",
+                "email": "admin@unison.local",
+                "hashed_password": "$2b$12$cE3Q0zl9Gf3Ur4IDzI1WLOMZbADNLlNGMuREOSoQk.wKQorvumtAu",  # 'admin123'
+                "roles": ["admin"],
+                "active": True,
+                "created_at": datetime.utcnow().isoformat()
+            },
+            "operator": {
+                "username": "operator",
+                "email": "operator@unison.local",
+                "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",  # 'operator123'
+                "roles": ["operator"],
+                "active": True,
+                "created_at": datetime.utcnow().isoformat()
+            },
+            "developer": {
+                "username": "developer",
+                "email": "dev@unison.local",
+                "hashed_password": "$2b$12$9DhGvMweApXn5gEksNl4nOJG4wB9f7kL8aXqFqk9X2YjVzZ3Rw5e",  # 'dev123'
+                "roles": ["developer"],
+                "active": True,
+                "created_at": datetime.utcnow().isoformat()
+            },
+            "user": {
+                "username": "user",
+                "email": "user@unison.local",
+                "hashed_password": "$2b$12$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",  # 'user123'
+                "roles": ["user"],
+                "active": True,
+                "created_at": datetime.utcnow().isoformat()
+            }
+        })
+        logger.warning("Running in development mode with default users")
+    return users
+
+# Initialize user database
+USERS_DB = get_default_users()
 
 # Service accounts for inter-service communication
 SERVICE_ACCOUNTS = {
     "orchestrator": {
         "username": "service-orchestrator",
-        "secret": os.getenv("UNISON_ORCHESTRATOR_SERVICE_SECRET", "orchestrator-secret"),
+        "secret": os.getenv("UNISON_ORCHESTRATOR_SERVICE_SECRET"),
         "roles": ["service"]
     },
     "inference": {
         "username": "service-inference",
-        "secret": os.getenv("UNISON_INFERENCE_SERVICE_SECRET", "inference-secret"),
+        "secret": os.getenv("UNISON_INFERENCE_SERVICE_SECRET"),
         "roles": ["service"]
     },
     "policy": {
         "username": "service-policy",
-        "secret": os.getenv("UNISON_POLICY_SERVICE_SECRET", "policy-secret"),
+        "secret": os.getenv("UNISON_POLICY_SERVICE_SECRET"),
         "roles": ["service"]
     }
 }
@@ -185,6 +229,9 @@ def authenticate_service(service_name: str, secret: str) -> Optional[Dict[str, A
     service = SERVICE_ACCOUNTS.get(service_name)
     if not service:
         logger.warning(f"Service authentication failed: service {service_name} not found")
+        return None
+    if service["secret"] is None:
+        logger.error(f"Service authentication failed: secret not configured for {service_name}")
         return None
     if service["secret"] != secret:
         logger.warning(f"Service authentication failed: invalid secret for {service_name}")
@@ -297,11 +344,20 @@ def require_roles(required_roles: List[str]):
 # API Endpoints
 @app.post("/token", response_model=Token)
 async def login_for_access_token(
+    request: Request,
     username: str = Form(...),
     password: str = Form(...),
     grant_type: str = Form(default="password")
 ):
     """OAuth2 compatible token endpoint"""
+    # Basic per-IP rate limiting
+    client_ip = request.client.host if request and request.client else "unknown"
+    if is_rate_limited(client_ip):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Please try again later.",
+            headers={"Retry-After": str(TOKEN_RATE_WINDOW)}
+        )
     
     if grant_type not in ["password", "client_credentials"]:
         raise HTTPException(
