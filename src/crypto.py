@@ -72,7 +72,7 @@ class RSAKeyManager:
                             metadata = json.load(f)
                     else:
                         metadata = {
-                            "created_at": datetime.utcnow().isoformat(),
+                            "created_at": isoformat_utc(),
                             "active": True
                         }
                     
@@ -133,7 +133,7 @@ class RSAKeyManager:
     def _cleanup_old_keys(self):
         """Remove keys older than grace period (7 days) that are not current"""
         grace_period = timedelta(days=7)
-        cutoff_time = datetime.utcnow() - grace_period
+        cutoff_time = now_utc() - grace_period
         
         for kid in list(self.keys.keys()):
             if kid == self.current_kid:
@@ -199,7 +199,7 @@ class RSAKeyManager:
             Key ID of generated key
         """
         if kid is None:
-            kid = f"key-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+            kid = f"key-{now_utc().strftime('%Y%m%d-%H%M%S')}"
         
         logger.info(f"Generating new RSA key pair: {kid}")
         
@@ -233,7 +233,7 @@ class RSAKeyManager:
         
         # Save metadata
         metadata = {
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": isoformat_utc(),
             "active": True
         }
         metadata_path = self.keys_dir / f"{kid}_metadata.json"
@@ -290,7 +290,7 @@ class RSAKeyManager:
                 with open(metadata_path, 'r') as f:
                     metadata = json.load(f)
                 metadata["active"] = False
-                metadata["deactivated_at"] = datetime.utcnow().isoformat()
+                metadata["deactivated_at"] = isoformat_utc()
                 with open(metadata_path, 'w') as f:
                     json.dump(metadata, f, indent=2)
             
@@ -444,3 +444,4 @@ def get_key_manager() -> RSAKeyManager:
             _key_manager.generate_key_pair("primary-2025-11")
     
     return _key_manager
+from unison_common.datetime_utils import now_utc, isoformat_utc

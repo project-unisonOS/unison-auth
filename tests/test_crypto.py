@@ -7,6 +7,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
+from unison_common.datetime_utils import now_utc
 from jose import jwt, JWTError
 
 import sys
@@ -57,8 +58,8 @@ class TestRSAKeyManager:
         
         payload = {
             "sub": "user123",
-            "exp": datetime.utcnow() + timedelta(hours=1),
-            "iat": datetime.utcnow()
+            "exp": now_utc() + timedelta(hours=1),
+            "iat": now_utc()
         }
         
         token = key_manager.sign_token(payload, kid)
@@ -77,8 +78,8 @@ class TestRSAKeyManager:
         
         payload = {
             "sub": "user123",
-            "exp": datetime.utcnow() + timedelta(hours=1),
-            "iat": datetime.utcnow(),
+            "exp": now_utc() + timedelta(hours=1),
+            "iat": now_utc(),
             "roles": ["user"]
         }
         
@@ -103,8 +104,8 @@ class TestRSAKeyManager:
         
         payload = {
             "sub": "user123",
-            "exp": datetime.utcnow() - timedelta(hours=1),  # Expired
-            "iat": datetime.utcnow() - timedelta(hours=2)
+            "exp": now_utc() - timedelta(hours=1),  # Expired
+            "iat": now_utc() - timedelta(hours=2)
         }
         
         token = key_manager.sign_token(payload, kid)
@@ -185,7 +186,7 @@ class TestRSAKeyManager:
         
         payload = {
             "sub": "user123",
-            "exp": datetime.utcnow() + timedelta(hours=1)
+            "exp": now_utc() + timedelta(hours=1)
         }
         
         token = key_manager.sign_token(payload)  # No kid specified
@@ -199,8 +200,8 @@ class TestRSAKeyManager:
         old_kid = key_manager.generate_key_pair("old-key")
         payload = {
             "sub": "user123",
-            "exp": datetime.utcnow() + timedelta(hours=1),
-            "iat": datetime.utcnow()
+            "exp": now_utc() + timedelta(hours=1),
+            "iat": now_utc()
         }
         old_token = key_manager.sign_token(payload, old_kid)
         

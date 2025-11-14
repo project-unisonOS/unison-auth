@@ -14,15 +14,18 @@ import logging
 # P0.1: Import RSA key manager and JWKS router
 from .crypto import get_key_manager
 from .jwks import router as jwks_router
+from .settings import AuthServiceSettings
 from unison_common.tracing_middleware import TracingMiddleware
 from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
+SETTINGS = AuthServiceSettings.from_env()
+
 # /token rate limiting config
-TOKEN_RATE_LIMIT = int(os.getenv("AUTH_TOKEN_RATE_LIMIT", "10"))  # requests per window
-TOKEN_RATE_WINDOW = int(os.getenv("AUTH_TOKEN_RATE_WINDOW_SECONDS", "60"))  # seconds
+TOKEN_RATE_LIMIT = SETTINGS.rate_limit.limit
+TOKEN_RATE_WINDOW = SETTINGS.rate_limit.window_seconds  # seconds
 
 def _rate_limit_key(ip: str) -> str:
     return f"rl:token:{ip}"
@@ -62,21 +65,21 @@ instrument_httpx()
 
 # Configuration
 # P0.1: Removed SECRET_KEY and HS256 - now using RS256 with RSA keys
-ALGORITHM = "RS256"  # Changed from HS256 to RS256
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("UNISON_ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
-REFRESH_TOKEN_EXPIRE_MINUTES = int(os.getenv("UNISON_REFRESH_TOKEN_EXPIRE_MINUTES", "1440"))  # 24 hours
+ALGORITHM = SETTINGS.algorithm
+ACCESS_TOKEN_EXPIRE_MINUTES = SETTINGS.access_token_expire_minutes
+REFRESH_TOKEN_EXPIRE_MINUTES = SETTINGS.refresh_token_expire_minutes  # 24 hours
 
 # P0.1: Initialize RSA key manager
 key_manager = get_key_manager()
 
 # Redis for token blacklist and session storage
 redis_client = redis.Redis(
-    host=os.getenv("REDIS_HOST", "localhost"),
-    port=int(os.getenv("REDIS_PORT", "6379")),
-    password=os.getenv("REDIS_PASSWORD"),
+    host=SETTINGS.redis.host,
+    port=SETTINGS.redis.port,
+    password=SETTINGS.redis.password,
     decode_responses=True,
     socket_connect_timeout=5,
-    socket_timeout=5
+    socket_timeout=5,
 )
 
 # Password hashing
@@ -129,7 +132,7 @@ def get_default_users() -> Dict[str, Dict[str, Any]]:
                 "hashed_password": "$2b$12$cE3Q0zl9Gf3Ur4IDzI1WLOMZbADNLlNGMuREOSoQk.wKQorvumtAu",  # 'admin123'
                 "roles": ["admin"],
                 "active": True,
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": isoformat_utc()
             },
             "operator": {
                 "username": "operator",
@@ -137,7 +140,7 @@ def get_default_users() -> Dict[str, Dict[str, Any]]:
                 "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",  # 'operator123'
                 "roles": ["operator"],
                 "active": True,
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": isoformat_utc()
             },
             "developer": {
                 "username": "developer",
@@ -145,7 +148,7 @@ def get_default_users() -> Dict[str, Dict[str, Any]]:
                 "hashed_password": "$2b$12$9DhGvMweApXn5gEksNl4nOJG4wB9f7kL8aXqFqk9X2YjVzZ3Rw5e",  # 'dev123'
                 "roles": ["developer"],
                 "active": True,
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": isoformat_utc()
             },
             "user": {
                 "username": "user",
@@ -153,7 +156,7 @@ def get_default_users() -> Dict[str, Dict[str, Any]]:
                 "hashed_password": "$2b$12$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",  # 'user123'
                 "roles": ["user"],
                 "active": True,
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": isoformat_utc()
             }
         })
         logger.warning("Running in development mode with default users")
@@ -243,14 +246,14 @@ def authenticate_service(service_name: str, secret: str) -> Optional[Dict[str, A
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = now_utc() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = now_utc() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     
     to_encode.update({
         "exp": expire,
         "type": "access",
-        "iat": datetime.utcnow(),
+        "iat": now_utc(),
         "jti": f"access_{int(time.time())}_{data.get('sub', 'unknown')}"
     })
     
@@ -260,12 +263,12 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 def create_refresh_token(data: dict) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES)
+    expire = now_utc() + timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES)
     
     to_encode.update({
         "exp": expire,
         "type": "refresh",
-        "iat": datetime.utcnow(),
+        "iat": now_utc(),
         "jti": f"refresh_{int(time.time())}_{data.get('sub', 'unknown')}"
     })
     
@@ -589,7 +592,7 @@ async def create_user(
         "hashed_password": hashed_password,
         "roles": user.roles,
         "active": True,
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": isoformat_utc()
     }
     
     logger.info(f"User {user.username} created by admin {current_user['username']}")
@@ -608,7 +611,7 @@ async def health_check():
     return {
         "status": "ok",
         "service": "unison-auth",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": isoformat_utc()
     }
 
 @app.get("/readyz")
@@ -631,7 +634,7 @@ async def readiness_check():
     return {
         "status": "ready",
         "service": "unison-auth",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": isoformat_utc(),
         "dependencies": {
             "redis": "connected"
         }
@@ -663,3 +666,4 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
+from unison_common.datetime_utils import now_utc, isoformat_utc
