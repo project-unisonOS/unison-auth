@@ -2,6 +2,9 @@
 
 Authentication and authorization service for the Unison platform, providing secure identity management, token-based authentication, and role-based access control.
 
+## Status
+Core service (active) — required by devstack at port 8088 for JWT/RBAC.
+
 ## Purpose
 
 The auth service:
@@ -48,12 +51,12 @@ git clone https://github.com/project-unisonOS/unison-auth
 cd unison-auth
 
 # Install dependencies
-pip install -r requirements.txt
+python3 -m venv .venv && . .venv/bin/activate
+pip install -c ../constraints.txt -r requirements.txt
 
 # Set environment variables
-export UNISON_JWT_SECRET="your-256-bit-secret-key-here"
-export REDIS_HOST="localhost"
-export REDIS_PORT="6379"
+cp .env.example .env
+export $(cat .env | xargs)
 
 # Run the service
 python src/auth_service.py
@@ -63,17 +66,24 @@ python src/auth_service.py
 ```bash
 # Using the development stack
 cd ../unison-devstack
-docker-compose up -d auth
+docker compose up -d auth
 
 # Health check
 curl http://localhost:8088/health
+```
+
+## Testing
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -c ../constraints.txt -r requirements.txt
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OTEL_SDK_DISABLED=true python -m pytest
 ```
 
 ### Security-Hardened Deployment
 ```bash
 # Using the security configuration
 cd ../unison-devstack
-docker-compose -f docker-compose.security.yml up -d
+docker compose -f docker-compose.security.yml up -d
 
 # Access through internal network
 curl http://auth:8088/health
@@ -117,7 +127,8 @@ curl -X POST http://localhost:8088/verify \
   -d '{"token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."}'
 ```
 
-[Full API Documentation](../../unison-docs/developer/api-reference/auth.md)
+Additional docs: workspace `docs/unison-architecture-overview.md` and `docs/developer-guide.md` cover how this service
+fits into the platform; legacy `unison-docs` references are archived.
 
 ## Configuration
 
@@ -223,25 +234,10 @@ pip install -r requirements-dev.txt
 python scripts/init_test_data.py
 
 # Run tests
-pytest tests/
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OTEL_SDK_DISABLED=true python -m pytest
 
 # Run with debug logging
 LOG_LEVEL=DEBUG python src/auth_service.py
-```
-
-### Testing
-```bash
-# Unit tests
-pytest tests/unit/
-
-# Integration tests
-pytest tests/integration/
-
-# Security tests
-pytest tests/security/
-
-# Performance tests
-pytest tests/performance/
 ```
 
 ### Contributing
@@ -250,8 +246,6 @@ pytest tests/performance/
 3. Make your changes with comprehensive security tests
 4. Ensure all authentication and security tests pass
 5. Submit a pull request with detailed security review
-
-[Development Guide](../../unison-docs/developer/contributing.md)
 
 ## Security and Privacy
 
@@ -274,8 +268,6 @@ pytest tests/performance/
 - **Security Standards**: Industry best practices for authentication
 - **Audit Requirements**: Complete audit trail for all authentication events
 - **Data Protection**: Privacy by design in all authentication flows
-
-[Security Documentation](../../unison-docs/operations/security.md)
 
 ## Architecture
 
@@ -309,8 +301,6 @@ pytest tests/performance/
 5. **Storage**: Store tokens in Redis for validation
 6. **Response**: Return tokens to client
 
-[Architecture Documentation](../../unison-docs/developer/architecture.md)
-
 ## Monitoring
 
 ### Health Checks
@@ -334,8 +324,6 @@ Structured JSON logging with correlation IDs:
 - Security warnings and violations
 - Role changes and permission updates
 - Performance metrics and bottlenecks
-
-[Monitoring Guide](../../unison-docs/operations/monitoring.md)
 
 ## Default Configuration
 
@@ -386,7 +374,7 @@ redis-cli -h localhost -p 6379 ping
 grep REDIS_ .env
 
 # Check Redis logs
-docker-compose logs redis
+docker compose logs redis
 ```
 
 **Token Validation Errors**
@@ -423,13 +411,11 @@ python scripts/check_lockout.py --username admin
 LOG_LEVEL=DEBUG AUTH_DEBUG_TOKENS=true python src/auth_service.py
 
 # Monitor authentication events
-docker-compose logs -f auth | jq '.'
+docker compose logs -f auth | jq '.'
 
 # Test authentication flow
 python scripts/test_auth.py --all
 ```
-
-[Troubleshooting Guide](../../unison-docs/people/troubleshooting.md)
 
 ## Version Compatibility
 
@@ -446,7 +432,6 @@ Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
 
 ## Support
 
-- **Documentation**: [Project Unison Docs](https://github.com/project-unisonOS/unison-docs)
 - **Issues**: [GitHub Issues](https://github.com/project-unisonOS/unison-auth/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/project-unisonOS/unison-auth/discussions)
 - **Security**: Report security issues to security@unisonos.org

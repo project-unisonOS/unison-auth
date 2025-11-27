@@ -6,7 +6,7 @@ from fastapi import APIRouter, Response, Request
 from typing import Dict
 import logging
 
-from .crypto import get_key_manager
+from crypto import get_key_manager
 
 logger = logging.getLogger(__name__)
 

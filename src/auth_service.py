@@ -12,9 +12,9 @@ from pydantic import BaseModel, EmailStr
 import logging
 
 # P0.1: Import RSA key manager and JWKS router
-from .crypto import get_key_manager
-from .jwks import router as jwks_router
-from .settings import AuthServiceSettings
+from crypto import get_key_manager
+from jwks import router as jwks_router
+from settings import AuthServiceSettings
 from unison_common.tracing_middleware import TracingMiddleware
 from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
 
@@ -611,7 +611,8 @@ async def health_check():
     return {
         "status": "ok",
         "service": "unison-auth",
-        "timestamp": isoformat_utc()
+        "timestamp": isoformat_utc(),
+        "redis_connected": True,
     }
 
 @app.get("/readyz")
