@@ -26,6 +26,7 @@ The auth service:
 - Token blacklisting and secure revocation mechanisms
 - Person management with admin functions and user creation
 - OAuth2-compatible endpoints for broad integration support
+- Supports new BCI-oriented scopes (`bci.raw.read`, `bci.intent.subscribe`, `bci.device.pair`, `bci.profile.manage`, `bci.export`, `bci.hid.map`) when issuing tokens/grants in coordination with consent/policy services
 - Redis-based token storage for scalability and performance
 - Comprehensive security features including rate limiting and CORS
 
