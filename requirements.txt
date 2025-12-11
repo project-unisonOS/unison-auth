@@ -9,7 +9,7 @@ pydantic==2.9.2
 python-dotenv==1.0.0
 
 # Needed for EmailStr in Pydantic models
-email-validator==2.1.0.post1
+email-validator==2.3.0
 
 # P0.1: RSA key management for RS256 JWT signing
 cryptography==41.0.7
