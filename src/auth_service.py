@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Form, Request
+from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import redis
 import os
+import json
 import re
 import time
 from typing import Optional, Dict, Any, List
@@ -117,10 +118,62 @@ class HealthResponse(BaseModel):
     timestamp: str
     redis_connected: bool
 
+class BootstrapStatus(BaseModel):
+    enabled: bool
+    admin_exists: bool
+    bootstrap_required: bool
+    user_store_path: str
+
+class BootstrapAdminRequest(BaseModel):
+    username: str
+    password: str
+    email: Optional[EmailStr] = None
+
+def load_users_from_store() -> Dict[str, Dict[str, Any]]:
+    """Load persisted users from local storage."""
+    path = SETTINGS.user_store_path
+    if not path or not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            logger.error("User store at %s is not a JSON object", path)
+            return {}
+        return data
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("Failed to load user store %s: %s", path, exc)
+        return {}
+
+def persist_users_db() -> None:
+    """Persist the in-memory user database to local storage."""
+    path = SETTINGS.user_store_path
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(USERS_DB, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+
+def has_admin_user() -> bool:
+    for user_data in USERS_DB.values():
+        if user_data.get("active", False) and "admin" in user_data.get("roles", []):
+            return True
+    return False
+
 # Mock user database (replace with real database in production)
 # In production, users should be stored in a secure database with properly hashed passwords
 def get_default_users() -> Dict[str, Dict[str, Any]]:
     """Get default users from environment or secure configuration"""
+    users = load_users_from_store()
+    if users:
+        logger.info("Loaded %s persisted users from %s", len(users), SETTINGS.user_store_path)
+        return users
+
     users: Dict[str, Dict[str, Any]] = {}
     # Only add default users in development mode
     if os.getenv("UNISON_AUTH_DEV_MODE", "false").lower() == "true":
@@ -594,6 +647,7 @@ async def create_user(
         "active": True,
         "created_at": isoformat_utc()
     }
+    persist_users_db()
     
     logger.info(f"User {user.username} created by admin {current_user['username']}")
     
@@ -602,6 +656,79 @@ async def create_user(
         "email": user.email,
         "roles": user.roles,
         "active": True
+    }
+
+@app.get("/bootstrap/status", response_model=BootstrapStatus)
+async def bootstrap_status():
+    """Report whether first-run admin bootstrap is still required."""
+    admin_exists = has_admin_user()
+    bootstrap_enabled = bool(SETTINGS.bootstrap_token)
+    return {
+        "enabled": bootstrap_enabled,
+        "admin_exists": admin_exists,
+        "bootstrap_required": bootstrap_enabled and not admin_exists,
+        "user_store_path": SETTINGS.user_store_path,
+    }
+
+@app.post("/bootstrap/admin", response_model=User, status_code=status.HTTP_201_CREATED)
+async def bootstrap_admin(
+    payload: BootstrapAdminRequest,
+    x_unison_bootstrap_token: Optional[str] = Header(default=None, alias="X-Unison-Bootstrap-Token"),
+):
+    """Create the first admin user through an explicit one-time bootstrap flow."""
+    if has_admin_user():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Bootstrap is closed because an admin user already exists",
+        )
+
+    if not SETTINGS.bootstrap_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Bootstrap token is not configured",
+        )
+
+    if x_unison_bootstrap_token != SETTINGS.bootstrap_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid bootstrap token",
+        )
+
+    if not validate_username(payload.username):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid username format"
+        )
+
+    if not validate_password(payload.password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password does not meet security requirements"
+        )
+
+    if payload.username in USERS_DB:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User already exists"
+        )
+
+    USERS_DB[payload.username] = {
+        "username": payload.username,
+        "email": payload.email,
+        "hashed_password": get_password_hash(payload.password),
+        "roles": ["admin"],
+        "active": True,
+        "created_at": isoformat_utc(),
+        "bootstrap": True,
+    }
+    persist_users_db()
+    logger.info("Bootstrap admin %s created", payload.username)
+
+    return {
+        "username": payload.username,
+        "email": payload.email,
+        "roles": ["admin"],
+        "active": True,
     }
 
 @app.get("/healthz", response_model=HealthResponse)
@@ -647,7 +774,8 @@ async def root():
     return {
         "service": "unison-auth",
         "version": "1.0.0",
-        "status": "running"
+        "status": "running",
+        "bootstrap_required": bool(SETTINGS.bootstrap_token) and not has_admin_user(),
     }
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ class AuthServiceSettings:
     algorithm: str = "RS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_minutes: int = 1440
+    user_store_path: str = "/keys/users.json"
+    bootstrap_token: Optional[str] = None
     redis: RedisSettings = field(default_factory=RedisSettings)
     rate_limit: RateLimitSettings = field(default_factory=RateLimitSettings)
 
@@ -34,6 +36,8 @@ class AuthServiceSettings:
             algorithm=os.getenv("UNISON_AUTH_ALGORITHM", "RS256"),
             access_token_expire_minutes=int(os.getenv("UNISON_ACCESS_TOKEN_EXPIRE_MINUTES", "30")),
             refresh_token_expire_minutes=int(os.getenv("UNISON_REFRESH_TOKEN_EXPIRE_MINUTES", "1440")),
+            user_store_path=os.getenv("UNISON_AUTH_USER_STORE_PATH", "/keys/users.json"),
+            bootstrap_token=os.getenv("UNISON_AUTH_BOOTSTRAP_TOKEN"),
             redis=RedisSettings(
                 host=os.getenv("REDIS_HOST", "localhost"),
                 port=int(os.getenv("REDIS_PORT", "6379")),
