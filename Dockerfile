@@ -22,7 +22,8 @@ COPY ${REPO_PATH}/src/ ./src/
 COPY ${REPO_PATH}/tests/ ./tests/
 
 RUN groupadd -r unison && useradd -r -g unison -u 1000 unison \
-    && chown -R unison:unison /app
+    && mkdir -p /keys \
+    && chown -R unison:unison /app /keys
 USER unison
 
 EXPOSE 8088
