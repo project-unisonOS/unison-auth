@@ -177,42 +177,31 @@ def get_default_users() -> Dict[str, Dict[str, Any]]:
     users: Dict[str, Dict[str, Any]] = {}
     # Only add default users in development mode
     if os.getenv("UNISON_AUTH_DEV_MODE", "false").lower() == "true":
-        # Development users with weak passwords - ONLY for development
-        users.update({
-            "admin": {
-                "username": "admin",
-                "email": "admin@unison.local",
-                "hashed_password": "$2b$12$cE3Q0zl9Gf3Ur4IDzI1WLOMZbADNLlNGMuREOSoQk.wKQorvumtAu",  # 'admin123'
-                "roles": ["admin"],
+        dev_seed_specs = (
+            ("admin", "UNISON_AUTH_DEV_ADMIN_PASSWORD", "admin@unison.local", ["admin"]),
+            ("operator", "UNISON_AUTH_DEV_OPERATOR_PASSWORD", "operator@unison.local", ["operator"]),
+            ("developer", "UNISON_AUTH_DEV_DEVELOPER_PASSWORD", "dev@unison.local", ["developer"]),
+            ("user", "UNISON_AUTH_DEV_USER_PASSWORD", "user@unison.local", ["user"]),
+        )
+        for username, env_name, email, roles in dev_seed_specs:
+            password = os.getenv(env_name)
+            if not password:
+                continue
+            users[username] = {
+                "username": username,
+                "email": email,
+                "hashed_password": pwd_context.hash(password),
+                "roles": roles,
                 "active": True,
-                "created_at": isoformat_utc()
-            },
-            "operator": {
-                "username": "operator",
-                "email": "operator@unison.local",
-                "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",  # 'operator123'
-                "roles": ["operator"],
-                "active": True,
-                "created_at": isoformat_utc()
-            },
-            "developer": {
-                "username": "developer",
-                "email": "dev@unison.local",
-                "hashed_password": "$2b$12$9DhGvMweApXn5gEksNl4nOJG4wB9f7kL8aXqFqk9X2YjVzZ3Rw5e",  # 'dev123'
-                "roles": ["developer"],
-                "active": True,
-                "created_at": isoformat_utc()
-            },
-            "user": {
-                "username": "user",
-                "email": "user@unison.local",
-                "hashed_password": "$2b$12$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",  # 'user123'
-                "roles": ["user"],
-                "active": True,
-                "created_at": isoformat_utc()
+                "created_at": isoformat_utc(),
             }
-        })
-        logger.warning("Running in development mode with default users")
+        if users:
+            logger.warning("Running in development mode with explicitly configured seeded users")
+        else:
+            logger.warning(
+                "UNISON_AUTH_DEV_MODE is enabled but no UNISON_AUTH_DEV_*_PASSWORD values were supplied; "
+                "skipping seeded dev users"
+            )
     return users
 
 # Initialize user database

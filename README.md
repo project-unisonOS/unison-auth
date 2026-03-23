@@ -75,6 +75,9 @@ Behavior:
 - created users are persisted to the local user store
 - later admin-created users are also persisted
 - `UNISON_AUTH_DEV_MODE=true` remains a development-only escape hatch and should not be enabled in production
+- when dev mode is enabled, seeded users are created only if explicit passwords are supplied via:
+  `UNISON_AUTH_DEV_ADMIN_PASSWORD`, `UNISON_AUTH_DEV_OPERATOR_PASSWORD`,
+  `UNISON_AUTH_DEV_DEVELOPER_PASSWORD`, and/or `UNISON_AUTH_DEV_USER_PASSWORD`
 
 ## Tests
 ```bash
