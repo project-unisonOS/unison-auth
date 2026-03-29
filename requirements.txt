@@ -15,6 +15,6 @@ email-validator==2.1.0.post1
 cryptography==41.0.7
 
 # P0.1: Schedule for daily key rotation
-schedule==1.2.0
+schedule==1.2.2
 
 # unison-common package (local install)
