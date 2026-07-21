@@ -765,6 +765,36 @@ async def accept_household_invitation(payload: InvitationAcceptRequest):
         "household_id": identity["household_id"],
     }
 
+@app.get("/households/members")
+async def list_household_members(current_user: Dict[str, Any] = Depends(get_current_user)):
+    try:
+        return {
+            "household_id": current_user["household_id"],
+            "members": IDENTITY_STORE.list_household_members(
+                requesting_person_id=current_user["person_id"],
+                household_id=current_user["household_id"],
+            ),
+            "private_resources_included": False,
+        }
+    except IdentityNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+@app.delete("/households/members/{person_id}")
+async def remove_household_member(
+    person_id: str,
+    current_user: Dict[str, Any] = Depends(require_roles(["household-admin", "admin"])),
+):
+    try:
+        return IDENTITY_STORE.remove_household_member(
+            removed_by_person_id=current_user["person_id"],
+            household_id=current_user["household_id"],
+            person_id=person_id,
+        )
+    except IdentityConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IdentityNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
 @app.post("/admin/workloads", status_code=status.HTTP_201_CREATED)
 async def create_workload(
     payload: WorkloadCreateRequest,

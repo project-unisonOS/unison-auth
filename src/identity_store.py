@@ -320,6 +320,82 @@ class IdentityStore:
             ).fetchall()
         return [identity for row in handles if (identity := self.identity_for_login(row["login_handle"]))]
 
+    def list_household_members(
+        self, *, requesting_person_id: str, household_id: str
+    ) -> list[dict[str, Any]]:
+        """Return operational membership facts without private resource handles."""
+        with self.connect() as connection:
+            requester = connection.execute(
+                """SELECT 1 FROM household_memberships
+                   WHERE household_id=? AND person_id=? AND status='active'""",
+                (household_id, requesting_person_id),
+            ).fetchone()
+            if requester is None:
+                raise IdentityNotFound("household membership is unavailable")
+            rows = connection.execute(
+                """SELECT p.person_id, p.display_name, hm.role AS membership_role,
+                          hm.status, ai.assistant_instance_id
+                   FROM household_memberships hm
+                   JOIN persons p ON p.person_id=hm.person_id
+                   JOIN assistant_instances ai ON ai.person_id=p.person_id
+                   WHERE hm.household_id=? ORDER BY hm.created_at""",
+                (household_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def remove_household_member(
+        self,
+        *,
+        removed_by_person_id: str,
+        household_id: str,
+        person_id: str,
+        reason: str = "household-member-removal",
+    ) -> dict[str, Any]:
+        """Revoke appliance access without exposing or transferring private data."""
+        if removed_by_person_id == person_id:
+            raise IdentityConflict("household administrators cannot remove themselves")
+        with self.transaction() as connection:
+            administrator = connection.execute(
+                """SELECT role FROM household_memberships
+                   WHERE household_id=? AND person_id=? AND status='active'""",
+                (household_id, removed_by_person_id),
+            ).fetchone()
+            if administrator is None or administrator["role"] != "household-admin":
+                raise IdentityNotFound("household membership is unavailable")
+            member = connection.execute(
+                """SELECT hm.membership_id, p.display_name, ai.assistant_instance_id
+                   FROM household_memberships hm
+                   JOIN persons p ON p.person_id=hm.person_id
+                   JOIN assistant_instances ai ON ai.person_id=p.person_id
+                   WHERE hm.household_id=? AND hm.person_id=? AND hm.status='active'""",
+                (household_id, person_id),
+            ).fetchone()
+            if member is None:
+                raise IdentityNotFound("household membership is unavailable")
+            revoked_at = iso()
+            connection.execute(
+                "UPDATE household_memberships SET status='revoked', revoked_at=? WHERE membership_id=?",
+                (revoked_at, member["membership_id"]),
+            )
+            connection.execute(
+                "UPDATE assistant_instances SET status='revoked' WHERE person_id=?",
+                (person_id,),
+            )
+            connection.execute("UPDATE login_accounts SET active=0 WHERE person_id=?", (person_id,))
+            connection.execute(
+                """UPDATE sessions SET revoked_at=?, revocation_reason=?
+                   WHERE person_id=? AND revoked_at IS NULL""",
+                (revoked_at, reason, person_id),
+            )
+        return {
+            "person_id": person_id,
+            "assistant_instance_id": member["assistant_instance_id"],
+            "display_name": member["display_name"],
+            "status": "revoked",
+            "private_data_transferred": False,
+            "private_keys_disclosed": False,
+        }
+
     def issue_challenge(
         self,
         *,
