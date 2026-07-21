@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -26,18 +27,44 @@ class AuthServiceSettings:
     access_token_expire_minutes: int = 30
     refresh_token_expire_minutes: int = 1440
     user_store_path: str = "/keys/users.json"
+    identity_database_path: str = "/tmp/unison-auth/identity.db"
+    person_audiences: tuple[str, ...] = (
+        "orchestrator",
+        "context",
+        "storage",
+        "renderer",
+        "comms",
+        "capability",
+        "policy",
+        "consent",
+        "payments",
+        "actuation",
+    )
     bootstrap_token: Optional[str] = None
     redis: RedisSettings = field(default_factory=RedisSettings)
     rate_limit: RateLimitSettings = field(default_factory=RateLimitSettings)
 
     @classmethod
     def from_env(cls) -> "AuthServiceSettings":
+        bootstrap_token = os.getenv("UNISON_AUTH_BOOTSTRAP_TOKEN")
+        bootstrap_file = os.getenv("UNISON_AUTH_BOOTSTRAP_TOKEN_FILE")
+        if bootstrap_file:
+            bootstrap_token = Path(bootstrap_file).read_text(encoding="utf-8").strip()
         return cls(
             algorithm=os.getenv("UNISON_AUTH_ALGORITHM", "RS256"),
             access_token_expire_minutes=int(os.getenv("UNISON_ACCESS_TOKEN_EXPIRE_MINUTES", "30")),
             refresh_token_expire_minutes=int(os.getenv("UNISON_REFRESH_TOKEN_EXPIRE_MINUTES", "1440")),
             user_store_path=os.getenv("UNISON_AUTH_USER_STORE_PATH", "/keys/users.json"),
-            bootstrap_token=os.getenv("UNISON_AUTH_BOOTSTRAP_TOKEN"),
+            identity_database_path=os.getenv("UNISON_AUTH_IDENTITY_DATABASE_PATH", "/tmp/unison-auth/identity.db"),
+            person_audiences=tuple(
+                item.strip()
+                for item in os.getenv(
+                    "UNISON_AUTH_PERSON_AUDIENCES",
+                    "orchestrator,context,storage,renderer,comms,capability,policy,consent,payments,actuation",
+                ).split(",")
+                if item.strip()
+            ),
+            bootstrap_token=bootstrap_token,
             redis=RedisSettings(
                 host=os.getenv("REDIS_HOST", "localhost"),
                 port=int(os.getenv("REDIS_PORT", "6379")),
