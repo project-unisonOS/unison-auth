@@ -1,16 +1,20 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Header
+from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Header, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import redis
-import os
-import json
+import sqlite3
 import re
 import time
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, EmailStr
 import logging
+import secrets
+import base64
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 # P0.1: Import RSA key manager and JWKS router
 from crypto import get_key_manager
@@ -18,6 +22,12 @@ from jwks import router as jwks_router
 from settings import AuthServiceSettings
 from unison_common.tracing_middleware import TracingMiddleware
 from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
+from identity_store import (
+    IdentityConflict,
+    IdentityNotFound,
+    IdentityRevoked,
+    IdentityStore,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -94,6 +104,9 @@ class User(BaseModel):
     email: Optional[EmailStr] = None
     roles: List[str]
     active: bool = True
+    person_id: Optional[str] = None
+    assistant_instance_id: Optional[str] = None
+    household_id: Optional[str] = None
 
 class UserCreate(BaseModel):
     username: str
@@ -123,108 +136,60 @@ class BootstrapStatus(BaseModel):
     admin_exists: bool
     bootstrap_required: bool
     user_store_path: str
+    identity_database_path: str
+    schema_version: int
 
 class BootstrapAdminRequest(BaseModel):
     username: str
     password: str
     email: Optional[EmailStr] = None
+    display_name: str
+    household_name: str = "My household"
+    confirmed: bool = False
 
-def load_users_from_store() -> Dict[str, Dict[str, Any]]:
-    """Load persisted users from local storage."""
-    path = SETTINGS.user_store_path
-    if not path or not os.path.exists(path):
-        return {}
+class InvitationCreateRequest(BaseModel):
+    intended_role: str = "adult-member"
+    ttl_minutes: int = 30
 
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if not isinstance(data, dict):
-            logger.error("User store at %s is not a JSON object", path)
-            return {}
-        return data
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.error("Failed to load user store %s: %s", path, exc)
-        return {}
+class InvitationAcceptRequest(BaseModel):
+    invitation_token: str
+    username: str
+    display_name: str
+    password: str
+    email: Optional[EmailStr] = None
 
-def persist_users_db() -> None:
-    """Persist the in-memory user database to local storage."""
-    path = SETTINGS.user_store_path
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
+class WorkloadCreateRequest(BaseModel):
+    client_id: str
+    secret: str
+    audiences: List[str]
+    scopes: List[str] = []
 
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(USERS_DB, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, path)
+class PasskeyRegisterRequest(BaseModel):
+    challenge_id: str
+    challenge: str
+    credential_id: str
+    public_key_pem: str
+    proof_signature_b64: str
+    transports: List[str] = []
+
+class PasskeyAuthenticateRequest(BaseModel):
+    challenge_id: str
+    challenge: str
+    credential_id: str
+    signature_b64: str
+    sign_count: int
+
+class WorkloadDelegationRequest(BaseModel):
+    client_id: str
+    audience: str
+    scopes: List[str]
+    purpose: str
+    ttl_seconds: int = 300
+
+IDENTITY_STORE = IdentityStore(SETTINGS.identity_database_path)
 
 def has_admin_user() -> bool:
-    for user_data in USERS_DB.values():
-        if user_data.get("active", False) and "admin" in user_data.get("roles", []):
-            return True
-    return False
-
-# Mock user database (replace with real database in production)
-# In production, users should be stored in a secure database with properly hashed passwords
-def get_default_users() -> Dict[str, Dict[str, Any]]:
-    """Get default users from environment or secure configuration"""
-    users = load_users_from_store()
-    if users:
-        logger.info("Loaded %s persisted users from %s", len(users), SETTINGS.user_store_path)
-        return users
-
-    users: Dict[str, Dict[str, Any]] = {}
-    # Only add default users in development mode
-    if os.getenv("UNISON_AUTH_DEV_MODE", "false").lower() == "true":
-        dev_seed_specs = (
-            ("admin", "UNISON_AUTH_DEV_ADMIN_PASSWORD", "admin@unison.local", ["admin"]),
-            ("operator", "UNISON_AUTH_DEV_OPERATOR_PASSWORD", "operator@unison.local", ["operator"]),
-            ("developer", "UNISON_AUTH_DEV_DEVELOPER_PASSWORD", "dev@unison.local", ["developer"]),
-            ("user", "UNISON_AUTH_DEV_USER_PASSWORD", "user@unison.local", ["user"]),
-        )
-        for username, env_name, email, roles in dev_seed_specs:
-            password = os.getenv(env_name)
-            if not password:
-                continue
-            users[username] = {
-                "username": username,
-                "email": email,
-                "hashed_password": pwd_context.hash(password),
-                "roles": roles,
-                "active": True,
-                "created_at": isoformat_utc(),
-            }
-        if users:
-            logger.warning("Running in development mode with explicitly configured seeded users")
-        else:
-            logger.warning(
-                "UNISON_AUTH_DEV_MODE is enabled but no UNISON_AUTH_DEV_*_PASSWORD values were supplied; "
-                "skipping seeded dev users"
-            )
-    return users
-
-# Initialize user database
-USERS_DB = get_default_users()
-
-# Service accounts for inter-service communication
-SERVICE_ACCOUNTS = {
-    "orchestrator": {
-        "username": "service-orchestrator",
-        "secret": os.getenv("UNISON_ORCHESTRATOR_SERVICE_SECRET"),
-        "roles": ["service"]
-    },
-    "inference": {
-        "username": "service-inference",
-        "secret": os.getenv("UNISON_INFERENCE_SERVICE_SECRET"),
-        "roles": ["service"]
-    },
-    "policy": {
-        "username": "service-policy",
-        "secret": os.getenv("UNISON_POLICY_SERVICE_SECRET"),
-        "roles": ["service"]
-    }
-}
+    return IDENTITY_STORE.has_admin()
 
 def validate_password(password: str) -> bool:
     """Validate password strength"""
@@ -253,7 +218,7 @@ def get_password_hash(password: str) -> str:
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def get_user(username: str) -> Optional[Dict[str, Any]]:
-    return USERS_DB.get(username)
+    return IDENTITY_STORE.identity_for_login(username)
 
 def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
     user = get_user(username)
@@ -263,7 +228,7 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
     if not user.get("active", False):
         logger.warning(f"Authentication failed: user {username} is inactive")
         return None
-    if not verify_password(password, user["hashed_password"]):
+    if not verify_password(password, user["password_hash"]):
         logger.warning(f"Authentication failed: invalid password for {username}")
         return None
     
@@ -271,19 +236,66 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
     return user
 
 def authenticate_service(service_name: str, secret: str) -> Optional[Dict[str, Any]]:
-    service = SERVICE_ACCOUNTS.get(service_name)
+    service = IDENTITY_STORE.workload_for_client(service_name)
     if not service:
         logger.warning(f"Service authentication failed: service {service_name} not found")
         return None
-    if service["secret"] is None:
-        logger.error(f"Service authentication failed: secret not configured for {service_name}")
-        return None
-    if service["secret"] != secret:
+    if not verify_password(secret, service["secret_hash"]):
         logger.warning(f"Service authentication failed: invalid secret for {service_name}")
         return None
-    
+    service["username"] = service_name
+    service["roles"] = ["service"]
     logger.info(f"Service {service_name} authenticated successfully")
     return service
+
+def person_authority_claims(identity: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    """Claims are populated only from transactional server-side membership."""
+    return {
+        "sub": identity["principal_id"],
+        "principal_id": identity["principal_id"],
+        "principal_kind": "person",
+        "person_id": identity["person_id"],
+        "assistant_instance_id": identity["assistant_instance_id"],
+        "household_id": identity["household_id"],
+        "membership_id": identity["membership_id"],
+        "login_handle": identity["login_handle"],
+        "display_name": identity["display_name"],
+        "roles": identity["roles"],
+        "scopes": ["assistant:use", "profile:read", "profile:write"],
+        "aud": list(SETTINGS.person_audiences),
+        "auth_method": "password",
+        "assurance": "medium",
+        "session_id": session_id,
+        "key_handle": identity["key_handle"],
+        "credential_namespace": identity["credential_namespace"],
+        "data_namespace": identity["data_namespace"],
+        "cache_namespace": identity["cache_namespace"],
+        "index_namespace": identity["index_namespace"],
+    }
+
+def workload_authority_claims(workload: Dict[str, Any], audience: str) -> Dict[str, Any]:
+    if audience not in workload["audiences"]:
+        raise HTTPException(status_code=403, detail="Requested workload audience is not authorized")
+    return {
+        "sub": workload["principal_id"],
+        "principal_id": workload["principal_id"],
+        "principal_kind": "workload",
+        "roles": ["service"],
+        "scopes": workload["scopes"],
+        "aud": [audience],
+        "auth_method": "client-secret",
+        "assurance": "high",
+    }
+
+def _verify_public_key_signature(public_key_pem: str, signature_b64: str, message: bytes) -> None:
+    try:
+        public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+        if not isinstance(public_key, Ed25519PublicKey):
+            raise ValueError("Only Ed25519 passkey proofs are accepted by this local ceremony")
+        signature = base64.urlsafe_b64decode(signature_b64 + "=" * (-len(signature_b64) % 4))
+        public_key.verify(signature, message)
+    except (ValueError, TypeError, InvalidSignature) as exc:
+        raise HTTPException(status_code=401, detail="Passkey proof is invalid") from exc
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
@@ -296,7 +308,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
         "exp": expire,
         "type": "access",
         "iat": now_utc(),
-        "jti": f"access_{int(time.time())}_{data.get('sub', 'unknown')}"
+        "jti": f"access_{secrets.token_hex(16)}"
     })
     
     # P0.1: Use RSA key manager to sign with RS256
@@ -311,7 +323,7 @@ def create_refresh_token(data: dict) -> str:
         "exp": expire,
         "type": "refresh",
         "iat": now_utc(),
-        "jti": f"refresh_{int(time.time())}_{data.get('sub', 'unknown')}"
+        "jti": f"refresh_{secrets.token_hex(16)}"
     })
     
     # P0.1: Use RSA key manager to sign with RS256
@@ -323,7 +335,7 @@ def is_token_blacklisted(jti: str) -> bool:
         return redis_client.exists(f"blacklist:{jti}")
     except redis.ConnectionError:
         logger.error("Redis connection error when checking blacklist")
-        return False  # Fail safe - allow token if Redis is down
+        return True  # Revocation status is unknown: fail closed.
 
 def blacklist_token(jti: str, exp: int):
     """Add token to blacklist with TTL"""
@@ -358,7 +370,7 @@ async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] =
     if payload is None:
         raise credentials_exception
     
-    username: str = payload.get("sub")
+    username: str = payload.get("login_handle")
     jti: str = payload.get("jti")
     token_type: str = payload.get("type")
     
@@ -366,6 +378,11 @@ async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] =
         raise credentials_exception
     
     if is_token_blacklisted(jti):
+        raise credentials_exception
+
+    session_id = payload.get("session_id")
+    person_id = payload.get("person_id")
+    if not session_id or not IDENTITY_STORE.session_is_active(session_id, person_id):
         raise credentials_exception
     
     user = get_user(username=username)
@@ -392,7 +409,8 @@ async def login_for_access_token(
     request: Request,
     username: str = Form(...),
     password: str = Form(...),
-    grant_type: str = Form(default="password")
+    grant_type: str = Form(default="password"),
+    audience: Optional[str] = Form(default=None),
 ):
     """OAuth2 compatible token endpoint"""
     # Basic per-IP rate limiting
@@ -420,13 +438,20 @@ async def login_for_access_token(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         
+        session_id = IDENTITY_STORE.create_session(
+            user,
+            auth_method="password",
+            assurance="medium",
+            lifetime_minutes=REFRESH_TOKEN_EXPIRE_MINUTES,
+        )
+        claims = person_authority_claims(user, session_id)
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            data={"sub": user["username"], "roles": user["roles"]}, 
+            data=claims,
             expires_delta=access_token_expires
         )
         refresh_token = create_refresh_token(
-            data={"sub": user["username"], "roles": user["roles"]}
+            data=claims
         )
         
     else:  # client_credentials
@@ -439,13 +464,16 @@ async def login_for_access_token(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         
+        if not audience:
+            raise HTTPException(status_code=400, detail="Workload audience is required")
+        claims = workload_authority_claims(service, audience)
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            data={"sub": service["username"], "roles": service["roles"]}, 
+            data=claims,
             expires_delta=access_token_expires
         )
         refresh_token = create_refresh_token(
-            data={"sub": service["username"], "roles": service["roles"]}
+            data=claims
         )
     
     return {
@@ -466,7 +494,7 @@ async def refresh_access_token(refresh_token: str):
             detail="Invalid refresh token"
         )
     
-    username: str = payload.get("sub")
+    username: str = payload.get("login_handle")
     token_type: str = payload.get("type")
     jti: str = payload.get("jti")
     
@@ -482,41 +510,28 @@ async def refresh_access_token(refresh_token: str):
             detail="Refresh token has been revoked"
         )
     
-    # Check if user is still active
+    if payload.get("principal_kind") != "person":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Workload tokens must be renewed with client credentials",
+        )
+    if not IDENTITY_STORE.session_is_active(payload.get("session_id", ""), payload.get("person_id")):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session has been revoked or expired",
+        )
+
+    # Re-read membership and resource handles so refresh cannot preserve stale authority.
     user = get_user(username=username)
-    if not user and not username.startswith("service-"):
+    if not user or not user.get("active"):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive"
         )
-    
-    # Create new tokens
-    if user:
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user["username"], "roles": user["roles"]}, 
-            expires_delta=access_token_expires
-        )
-        refresh_token_new = create_refresh_token(
-            data={"sub": user["username"], "roles": user["roles"]}
-        )
-    else:
-        # Service account
-        service = SERVICE_ACCOUNTS.get(username.replace("service-", ""))
-        if service:
-            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-            access_token = create_access_token(
-                data={"sub": service["username"], "roles": service["roles"]}, 
-                expires_delta=access_token_expires
-            )
-            refresh_token_new = create_refresh_token(
-                data={"sub": service["username"], "roles": service["roles"]}
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Service not found"
-            )
+    claims = person_authority_claims(user, payload["session_id"])
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(data=claims, expires_delta=access_token_expires)
+    refresh_token_new = create_refresh_token(data=claims)
     
     # Blacklist old refresh token
     blacklist_token(jti, payload.get("exp", int(time.time()) + 3600))
@@ -542,6 +557,9 @@ async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
         jti: str = payload.get("jti")
         exp: int = payload.get("exp", int(time.time()) + 3600)
         blacklist_token(jti, exp)
+        session_id = payload.get("session_id")
+        if session_id:
+            IDENTITY_STORE.revoke_session(session_id, "logout")
     
     return {"message": "Successfully logged out"}
 
@@ -570,34 +588,45 @@ async def verify_token_endpoint(request: dict):
             detail="Token has been revoked"
         )
     
+    if payload.get("session_id"):
+        if not IDENTITY_STORE.session_is_active(payload.get("session_id", ""), payload.get("person_id")):
+            raise HTTPException(status_code=401, detail="Session has been revoked or expired")
     return {
         "valid": True,
-        "username": payload.get("sub"),
+        "username": payload.get("login_handle") or payload.get("sub"),
+        "login_handle": payload.get("login_handle"),
         "roles": payload.get("roles", []),
         "type": token_type,
-        "exp": payload.get("exp")
+        "exp": payload.get("exp"),
+        "claims": payload,
     }
 
 @app.get("/me", response_model=User)
 async def read_users_me(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Get current user information"""
     return {
-        "username": current_user["username"],
+        "username": current_user["login_handle"],
         "email": current_user.get("email"),
         "roles": current_user["roles"],
-        "active": current_user.get("active", True)
+        "active": current_user.get("active", True),
+        "person_id": current_user.get("person_id"),
+        "assistant_instance_id": current_user.get("assistant_instance_id"),
+        "household_id": current_user.get("household_id"),
     }
 
 @app.get("/admin/users", response_model=List[User])
 async def list_users(current_user: Dict[str, Any] = Depends(require_roles(["admin"]))):
     """List all users (admin only)"""
     users = []
-    for username, user_data in USERS_DB.items():
+    for user_data in IDENTITY_STORE.list_identities():
         users.append({
-            "username": user_data["username"],
+            "username": user_data["login_handle"],
             "email": user_data.get("email"),
             "roles": user_data["roles"],
-            "active": user_data.get("active", True)
+            "active": user_data.get("active", True),
+            "person_id": user_data.get("person_id"),
+            "assistant_instance_id": user_data.get("assistant_instance_id"),
+            "household_id": user_data.get("household_id"),
         })
     return users
 
@@ -606,46 +635,11 @@ async def create_user(
     user: UserCreate,
     current_user: Dict[str, Any] = Depends(require_roles(["admin"]))
 ):
-    """Create new user (admin only)"""
-    
-    if not validate_username(user.username):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid username format"
-        )
-    
-    if not validate_password(user.password):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password does not meet security requirements"
-        )
-    
-    if user.username in USERS_DB:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="User already exists"
-        )
-    
-    # Create user
-    hashed_password = get_password_hash(user.password)
-    USERS_DB[user.username] = {
-        "username": user.username,
-        "email": user.email,
-        "hashed_password": hashed_password,
-        "roles": user.roles,
-        "active": True,
-        "created_at": isoformat_utc()
-    }
-    persist_users_db()
-    
-    logger.info(f"User {user.username} created by admin {current_user['username']}")
-    
-    return {
-        "username": user.username,
-        "email": user.email,
-        "roles": user.roles,
-        "active": True
-    }
+    """Direct user creation is replaced by household invitation/pairing."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Use /households/invitations and /enrollment/accept-invitation",
+    )
 
 @app.get("/bootstrap/status", response_model=BootstrapStatus)
 async def bootstrap_status():
@@ -657,6 +651,8 @@ async def bootstrap_status():
         "admin_exists": admin_exists,
         "bootstrap_required": bootstrap_enabled and not admin_exists,
         "user_store_path": SETTINGS.user_store_path,
+        "identity_database_path": SETTINGS.identity_database_path,
+        "schema_version": IDENTITY_STORE.schema_version(),
     }
 
 @app.post("/bootstrap/admin", response_model=User, status_code=status.HTTP_201_CREATED)
@@ -695,30 +691,241 @@ async def bootstrap_admin(
             detail="Password does not meet security requirements"
         )
 
-    if payload.username in USERS_DB:
+    if get_user(payload.username):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="User already exists"
         )
 
-    USERS_DB[payload.username] = {
-        "username": payload.username,
-        "email": payload.email,
-        "hashed_password": get_password_hash(payload.password),
-        "roles": ["admin"],
-        "active": True,
-        "created_at": isoformat_utc(),
-        "bootstrap": True,
-    }
-    persist_users_db()
-    logger.info("Bootstrap admin %s created", payload.username)
+    try:
+        identity = IDENTITY_STORE.bootstrap_first_person(
+            confirmed=payload.confirmed,
+            login_handle=payload.username,
+            display_name=payload.display_name,
+            household_name=payload.household_name,
+            password_hash=get_password_hash(payload.password),
+            email=str(payload.email) if payload.email else None,
+        )
+    except IdentityConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    logger.info("First person enrollment completed for login handle %s", payload.username)
 
     return {
         "username": payload.username,
         "email": payload.email,
         "roles": ["admin"],
         "active": True,
+        "person_id": identity["person_id"],
+        "assistant_instance_id": identity["assistant_instance_id"],
+        "household_id": identity["household_id"],
     }
+
+@app.post("/households/invitations", status_code=status.HTTP_201_CREATED)
+async def create_household_invitation(
+    payload: InvitationCreateRequest,
+    current_user: Dict[str, Any] = Depends(require_roles(["household-admin", "admin"])),
+):
+    try:
+        token, invitation = IDENTITY_STORE.create_invitation(
+            invited_by_person_id=current_user["person_id"],
+            household_id=current_user["household_id"],
+            intended_role=payload.intended_role,
+            ttl_minutes=payload.ttl_minutes,
+        )
+    except IdentityNotFound as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    # The token is shown once and is never stored in recoverable form.
+    return {**invitation, "invitation_token": token, "status": "pending"}
+
+@app.post("/enrollment/accept-invitation", response_model=User, status_code=status.HTTP_201_CREATED)
+async def accept_household_invitation(payload: InvitationAcceptRequest):
+    if not validate_username(payload.username):
+        raise HTTPException(status_code=400, detail="Invalid username format")
+    if not validate_password(payload.password):
+        raise HTTPException(status_code=400, detail="Password does not meet security requirements")
+    try:
+        identity = IDENTITY_STORE.accept_invitation(
+            invitation_token=payload.invitation_token,
+            login_handle=payload.username,
+            display_name=payload.display_name,
+            password_hash=get_password_hash(payload.password),
+            email=str(payload.email) if payload.email else None,
+        )
+    except (IdentityNotFound, IdentityRevoked) as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    except (IdentityConflict, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=409, detail="Enrollment conflicts with an existing identity") from exc
+    return {
+        "username": payload.username,
+        "email": payload.email,
+        "roles": identity["roles"],
+        "active": True,
+        "person_id": identity["person_id"],
+        "assistant_instance_id": identity["assistant_instance_id"],
+        "household_id": identity["household_id"],
+    }
+
+@app.post("/admin/workloads", status_code=status.HTTP_201_CREATED)
+async def create_workload(
+    payload: WorkloadCreateRequest,
+    current_user: Dict[str, Any] = Depends(require_roles(["admin"])),
+):
+    if len(payload.secret) < 24:
+        raise HTTPException(status_code=400, detail="Workload secret must contain at least 24 characters")
+    try:
+        return IDENTITY_STORE.register_workload(
+            client_id=payload.client_id,
+            secret_hash=get_password_hash(payload.secret),
+            audiences=payload.audiences,
+            scopes=payload.scopes,
+        )
+    except (IdentityConflict, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+@app.post("/delegations/workload-token")
+async def delegate_workload_token(
+    payload: WorkloadDelegationRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    if not payload.purpose.strip():
+        raise HTTPException(status_code=400, detail="Delegation purpose is required")
+    if payload.ttl_seconds < 30 or payload.ttl_seconds > 600:
+        raise HTTPException(status_code=400, detail="Delegation lifetime must be between 30 and 600 seconds")
+    workload = IDENTITY_STORE.workload_for_client(payload.client_id)
+    if not workload or payload.audience not in workload["audiences"]:
+        raise HTTPException(status_code=403, detail="Workload or audience is not authorized")
+    allowed_scopes = set(workload["scopes"])
+    requested_scopes = set(payload.scopes)
+    if not requested_scopes or not requested_scopes.issubset(allowed_scopes):
+        raise HTTPException(status_code=403, detail="Delegation scopes exceed workload authority")
+    source_claims = decode_token(credentials.credentials) if credentials else None
+    if not source_claims:
+        raise HTTPException(status_code=401, detail="Authenticated session is required")
+    identity = IDENTITY_STORE.identity_for_person(current_user["person_id"])
+    delegation_id = f"dlg_{secrets.token_hex(16)}"
+    claims = {
+        **person_authority_claims(identity, source_claims["session_id"]),
+        "sub": workload["principal_id"],
+        "principal_id": workload["principal_id"],
+        "principal_kind": "workload",
+        "roles": ["service", "delegated"],
+        "scopes": sorted(requested_scopes),
+        "aud": [payload.audience],
+        "auth_method": "delegated-workload",
+        "assurance": source_claims.get("assurance", "medium"),
+        "delegation_id": delegation_id,
+        "delegated_by": current_user["principal_id"],
+        "purpose": payload.purpose,
+    }
+    return {
+        "access_token": create_access_token(claims, timedelta(seconds=payload.ttl_seconds)),
+        "token_type": "bearer",
+        "expires_in": payload.ttl_seconds,
+        "delegation_id": delegation_id,
+    }
+
+@app.post("/passkeys/register/options")
+async def passkey_register_options(current_user: Dict[str, Any] = Depends(get_current_user)):
+    challenge_id, challenge = IDENTITY_STORE.issue_challenge(
+        person_id=current_user["person_id"],
+        purpose="passkey-register",
+    )
+    return {
+        "challenge_id": challenge_id,
+        "challenge": challenge,
+        "person_id": current_user["person_id"],
+        "status": "confirmation-required",
+        "expires_in": 300,
+    }
+
+@app.post("/passkeys/register/complete", status_code=status.HTTP_201_CREATED)
+async def passkey_register_complete(
+    payload: PasskeyRegisterRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    person_id = IDENTITY_STORE.consume_challenge(
+        payload.challenge_id,
+        payload.challenge,
+        "passkey-register",
+    )
+    if person_id != current_user["person_id"]:
+        raise HTTPException(status_code=403, detail="Passkey challenge belongs to another principal")
+    _verify_public_key_signature(
+        payload.public_key_pem,
+        payload.proof_signature_b64,
+        f"unison-passkey-register:{payload.challenge}".encode("utf-8"),
+    )
+    try:
+        IDENTITY_STORE.register_passkey(
+            person_id=person_id,
+            credential_id=payload.credential_id,
+            public_key_pem=payload.public_key_pem,
+            transports=payload.transports,
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="Passkey credential already exists") from exc
+    return {"ok": True, "credential_id": payload.credential_id, "status": "active"}
+
+@app.post("/passkeys/authenticate/options")
+async def passkey_authenticate_options(username: str = Body(..., embed=True)):
+    identity = get_user(username)
+    # Use the same generic response delay/shape at the API boundary; unknown
+    # handles receive an unbound challenge that can never complete.
+    challenge_id, challenge = IDENTITY_STORE.issue_challenge(
+        person_id=identity["person_id"] if identity and identity.get("active") else None,
+        purpose="passkey-authenticate",
+    )
+    return {"challenge_id": challenge_id, "challenge": challenge, "expires_in": 300}
+
+@app.post("/passkeys/authenticate/complete", response_model=Token)
+async def passkey_authenticate_complete(payload: PasskeyAuthenticateRequest):
+    person_id = IDENTITY_STORE.consume_challenge(
+        payload.challenge_id,
+        payload.challenge,
+        "passkey-authenticate",
+    )
+    credential = IDENTITY_STORE.passkey(payload.credential_id)
+    if not person_id or not credential or credential["person_id"] != person_id:
+        raise HTTPException(status_code=401, detail="Passkey authentication failed")
+    message = f"unison-passkey-authenticate:{payload.challenge}:{payload.sign_count}".encode("utf-8")
+    _verify_public_key_signature(credential["public_key_pem"], payload.signature_b64, message)
+    IDENTITY_STORE.advance_passkey_counter(payload.credential_id, payload.sign_count)
+    identity = IDENTITY_STORE.identity_for_person(person_id)
+    if not identity or not identity.get("active"):
+        raise HTTPException(status_code=401, detail="Passkey authentication failed")
+    session_id = IDENTITY_STORE.create_session(
+        identity,
+        auth_method="passkey",
+        assurance="high",
+        lifetime_minutes=REFRESH_TOKEN_EXPIRE_MINUTES,
+    )
+    claims = person_authority_claims(identity, session_id)
+    claims["auth_method"] = "passkey"
+    claims["assurance"] = "high"
+    return {
+        "access_token": create_access_token(claims, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)),
+        "refresh_token": create_refresh_token(claims),
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
+
+@app.post("/sessions/{session_id}/revoke")
+async def revoke_session(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    # A person may revoke their own session. Admin authority does not grant
+    # access to another adult's private session identifiers.
+    if not IDENTITY_STORE.session_is_active(session_id, current_user["person_id"]):
+        raise HTTPException(status_code=404, detail="Session not found")
+    IDENTITY_STORE.revoke_session(session_id, "person-request")
+    return {"ok": True, "session_id": session_id, "status": "revoked"}
+
+@app.post("/persons/me/lock")
+async def lock_current_person(current_user: Dict[str, Any] = Depends(get_current_user)):
+    IDENTITY_STORE.lock_person(current_user["person_id"], "person-lock")
+    return {"ok": True, "status": "locked"}
 
 @app.get("/healthz", response_model=HealthResponse)
 @app.get("/health", response_model=HealthResponse)
