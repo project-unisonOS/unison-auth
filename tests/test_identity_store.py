@@ -79,6 +79,40 @@ def test_invitation_pairs_independent_person_into_household(tmp_path):
     assert invitation["invitation_id"].startswith("inv_")
 
 
+def test_household_admin_lists_minimized_members_and_removes_without_private_access(tmp_path):
+    store = make_store(tmp_path)
+    alice = bootstrap(store)
+    token, _ = store.create_invitation(
+        invited_by_person_id=alice["person_id"], household_id=alice["household_id"]
+    )
+    bob = store.accept_invitation(
+        invitation_token=token,
+        login_handle="bob-login",
+        display_name="Bob Example",
+        password_hash="hash-bob",
+    )
+    members = store.list_household_members(
+        requesting_person_id=bob["person_id"], household_id=alice["household_id"]
+    )
+    assert {member["person_id"] for member in members} == {alice["person_id"], bob["person_id"]}
+    assert all("key_handle" not in member and "data_namespace" not in member for member in members)
+
+    result = store.remove_household_member(
+        removed_by_person_id=alice["person_id"],
+        household_id=alice["household_id"],
+        person_id=bob["person_id"],
+    )
+    assert result["private_data_transferred"] is False
+    assert result["private_keys_disclosed"] is False
+    assert store.identity_for_person(bob["person_id"])["active"] is False
+    with pytest.raises(IdentityConflict):
+        store.remove_household_member(
+            removed_by_person_id=alice["person_id"],
+            household_id=alice["household_id"],
+            person_id=alice["person_id"],
+        )
+
+
 def test_session_revocation_and_lock_are_fail_closed(tmp_path):
     store = make_store(tmp_path)
     identity = bootstrap(store)
