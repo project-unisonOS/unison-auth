@@ -16,7 +16,7 @@ from typing import Any, Iterator
 from cryptography.fernet import Fernet, InvalidToken
 
 
-MIGRATION_VERSION = 1
+MIGRATION_VERSION = 2
 
 
 class IdentityConflict(RuntimeError):
@@ -80,13 +80,14 @@ class IdentityStore:
             connection.close()
 
     def apply_migrations(self) -> None:
-        script = (self.migrations_dir / "0001_phase1_identity.sql").read_text(encoding="utf-8")
         with self.connect() as connection:
-            connection.executescript(script)
-            connection.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-                (MIGRATION_VERSION, "phase1_identity", iso()),
-            )
+            for version, name in ((1, "phase1_identity"), (2, "phase5_channel_pairing")):
+                script = (self.migrations_dir / f"{version:04d}_{name}.sql").read_text(encoding="utf-8")
+                connection.executescript(script)
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                    (version, name, iso()),
+                )
 
     def schema_version(self) -> int:
         with self.connect() as connection:
@@ -570,6 +571,190 @@ class IdentityStore:
                 (channel_id, person_id, provider, _hash_token(external_subject), assurance, iso()),
             )
         return channel_id
+
+    def create_channel_pairing(
+        self,
+        *,
+        person_id: str,
+        provider: str,
+        provider_account_id: str,
+        local_assurance: str,
+        ttl_minutes: int = 10,
+    ) -> tuple[str, dict[str, Any]]:
+        if provider != "telegram":
+            raise IdentityConflict("provider is not approved for Phase 5")
+        if local_assurance not in {"high", "hardware", "passkey"}:
+            raise IdentityConflict("channel pairing requires stronger local authentication")
+        raw_code = f"{secrets.randbelow(1_000_000):06d}"
+        challenge_id = new_id("pair")
+        created = utc_now()
+        expires = created + timedelta(minutes=ttl_minutes)
+        with self.transaction() as connection:
+            identity = connection.execute(
+                """
+                SELECT ai.assistant_instance_id FROM persons p
+                JOIN assistant_instances ai ON ai.person_id=p.person_id
+                WHERE p.person_id=? AND p.status='active' AND ai.status='active'
+                """,
+                (person_id,),
+            ).fetchone()
+            if identity is None:
+                raise IdentityNotFound("person is unavailable")
+            connection.execute(
+                """
+                UPDATE channel_pairing_challenges SET status='revoked'
+                WHERE person_id=? AND provider=? AND provider_account_id=? AND status='pending'
+                """,
+                (person_id, provider, provider_account_id),
+            )
+            connection.execute(
+                "INSERT INTO channel_pairing_challenges VALUES (?, ?, ?, ?, ?, 'high', 'pending', ?, ?, NULL)",
+                (challenge_id, person_id, provider, provider_account_id, _hash_token(raw_code), iso(created), iso(expires)),
+            )
+        return raw_code, {
+            "challenge_id": challenge_id,
+            "provider": provider,
+            "provider_account_id": provider_account_id,
+            "expires_at": iso(expires),
+            "minimum_local_assurance": "high",
+        }
+
+    def complete_channel_pairing(
+        self,
+        *,
+        challenge_id: str,
+        pairing_code: str,
+        provider: str,
+        provider_account_id: str,
+        external_subject: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        subject_hash = _hash_token(external_subject)
+        guard = _hash_token(f"{provider}\x00{provider_account_id}\x00{external_subject}")
+        with self.transaction() as connection:
+            challenge = connection.execute(
+                "SELECT * FROM channel_pairing_challenges WHERE challenge_id=? AND status='pending'",
+                (challenge_id,),
+            ).fetchone()
+            if challenge is None:
+                raise IdentityNotFound("pairing is unavailable")
+            if datetime.fromisoformat(challenge["expires_at"].replace("Z", "+00:00")) <= now:
+                connection.execute(
+                    "UPDATE channel_pairing_challenges SET status='expired' WHERE challenge_id=?",
+                    (challenge_id,),
+                )
+                raise IdentityRevoked("pairing is unavailable")
+            if not secrets.compare_digest(challenge["code_hash"], _hash_token(pairing_code)):
+                raise IdentityNotFound("pairing is unavailable")
+            if challenge["provider"] != provider or challenge["provider_account_id"] != provider_account_id:
+                raise IdentityNotFound("pairing is unavailable")
+            existing = connection.execute(
+                """
+                SELECT ci.person_id FROM channel_identities ci
+                JOIN channel_binding_details d ON d.channel_identity_id=ci.channel_identity_id
+                WHERE ci.provider=? AND d.provider_account_id=?
+                  AND ci.external_subject_hash=? AND ci.status='active'
+                """,
+                (provider, provider_account_id, subject_hash),
+            ).fetchone()
+            if existing is not None:
+                raise IdentityConflict("pairing is unavailable")
+            identity = connection.execute(
+                "SELECT assistant_instance_id FROM assistant_instances WHERE person_id=? AND status='active'",
+                (challenge["person_id"],),
+            ).fetchone()
+            if identity is None:
+                raise IdentityNotFound("pairing is unavailable")
+            channel_id = new_id("chn")
+            connection.execute(
+                "INSERT INTO channel_identities VALUES (?, ?, ?, ?, 'low', 'active', ?, NULL)",
+                (channel_id, challenge["person_id"], provider, subject_hash, iso(now)),
+            )
+            connection.execute(
+                "INSERT INTO channel_binding_details VALUES (?, ?, ?, ?, ?, ?)",
+                (channel_id, identity["assistant_instance_id"], provider_account_id, challenge_id, iso(now), guard),
+            )
+            connection.execute(
+                "UPDATE channel_pairing_challenges SET status='used', completed_at=? WHERE challenge_id=?",
+                (iso(now), challenge_id),
+            )
+        return {
+            "channel_identity_id": channel_id,
+            "person_id": challenge["person_id"],
+            "assistant_instance_id": identity["assistant_instance_id"],
+            "provider": provider,
+            "provider_account_id": provider_account_id,
+            "assurance": "low",
+            "status": "active",
+        }
+
+    def complete_channel_pairing_by_code(
+        self,
+        *,
+        pairing_code: str,
+        provider: str,
+        provider_account_id: str,
+        external_subject: str,
+    ) -> dict[str, Any]:
+        """Complete a pending pairing without exposing its internal identifier remotely."""
+        with self.connect() as connection:
+            challenge = connection.execute(
+                """
+                SELECT challenge_id FROM channel_pairing_challenges
+                WHERE provider=? AND provider_account_id=? AND code_hash=? AND status='pending'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (provider, provider_account_id, _hash_token(pairing_code)),
+            ).fetchone()
+        if challenge is None:
+            raise IdentityNotFound("pairing is unavailable")
+        return self.complete_channel_pairing(
+            challenge_id=challenge["challenge_id"],
+            pairing_code=pairing_code,
+            provider=provider,
+            provider_account_id=provider_account_id,
+            external_subject=external_subject,
+        )
+
+    def resolve_channel_binding(
+        self, *, provider: str, provider_account_id: str, external_subject: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT ci.channel_identity_id, ci.person_id, ci.provider, ci.assurance,
+                       d.assistant_instance_id, d.provider_account_id
+                FROM channel_identities ci
+                JOIN channel_binding_details d ON d.channel_identity_id=ci.channel_identity_id
+                JOIN persons p ON p.person_id=ci.person_id
+                JOIN assistant_instances ai ON ai.assistant_instance_id=d.assistant_instance_id
+                WHERE ci.provider=? AND d.provider_account_id=?
+                  AND ci.external_subject_hash=? AND ci.status='active'
+                  AND p.status='active' AND ai.status='active'
+                """,
+                (provider, provider_account_id, _hash_token(external_subject)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def revoke_paired_channel(self, *, channel_identity_id: str, person_id: str) -> bool:
+        return self.revoke_channel_identity(channel_identity_id, person_id)
+
+    def revoke_provider_account_bindings(
+        self, *, person_id: str, provider: str, provider_account_id: str
+    ) -> int:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE channel_identities SET status='revoked', revoked_at=?
+                WHERE person_id=? AND provider=? AND status='active'
+                  AND channel_identity_id IN (
+                    SELECT channel_identity_id FROM channel_binding_details
+                    WHERE provider_account_id=?
+                  )
+                """,
+                (iso(), person_id, provider, provider_account_id),
+            )
+        return cursor.rowcount
 
     def revoke_channel_identity(self, channel_identity_id: str, person_id: str) -> bool:
         with self.transaction() as connection:

@@ -158,6 +158,27 @@ class InvitationAcceptRequest(BaseModel):
     password: str
     email: Optional[EmailStr] = None
 
+class ChannelPairingCreateRequest(BaseModel):
+    provider: str = "telegram"
+    provider_account_id: str
+    ttl_minutes: int = 10
+
+class ChannelPairingCompleteRequest(BaseModel):
+    pairing_code: str
+    provider: str = "telegram"
+    provider_account_id: str
+    external_subject: str
+
+class ChannelBindingResolveRequest(BaseModel):
+    provider: str = "telegram"
+    provider_account_id: str
+    external_subject: str
+
+class ChannelBindingRevokeRequest(BaseModel):
+    person_id: str
+    provider: str = "telegram"
+    provider_account_id: str
+
 class WorkloadCreateRequest(BaseModel):
     client_id: str
     secret: str
@@ -388,8 +409,26 @@ async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] =
     user = get_user(username=username)
     if user is None:
         raise credentials_exception
-    
-    return user
+    result = dict(user)
+    result["assurance"] = payload.get("assurance", "low")
+    return result
+
+async def require_channel_gateway(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Dict[str, Any]:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="workload authentication required")
+    payload = decode_token(credentials.credentials)
+    if (
+        payload is None
+        or payload.get("type") != "access"
+        or payload.get("principal_kind") != "workload"
+        or "channel:bind" not in payload.get("scopes", [])
+        or "auth" not in payload.get("aud", [])
+        or is_token_blacklisted(payload.get("jti"))
+    ):
+        raise HTTPException(status_code=403, detail="channel binding authority unavailable")
+    return payload
 
 def require_roles(required_roles: List[str]):
     """Dependency to require specific roles"""
@@ -794,6 +833,68 @@ async def remove_household_member(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except IdentityNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+@app.post("/channels/pairing", status_code=status.HTTP_201_CREATED)
+async def create_channel_pairing(
+    payload: ChannelPairingCreateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        code, challenge = IDENTITY_STORE.create_channel_pairing(
+            person_id=current_user["person_id"],
+            provider=payload.provider,
+            provider_account_id=payload.provider_account_id,
+            local_assurance=current_user.get("assurance", "low"),
+            ttl_minutes=payload.ttl_minutes,
+        )
+        return {
+            **challenge,
+            "pairing_code": code,
+            "instruction": f"Send /pair {code} in the private Telegram bot chat.",
+            "private_chat_only": True,
+            "channel_assurance": "low",
+        }
+    except IdentityConflict as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+@app.delete("/channels/{channel_identity_id}")
+async def revoke_channel_pairing(
+    channel_identity_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    if not IDENTITY_STORE.revoke_paired_channel(
+        channel_identity_id=channel_identity_id, person_id=current_user["person_id"]
+    ):
+        raise HTTPException(status_code=404, detail="channel is unavailable")
+    return {"status": "revoked", "channel_identity_id": channel_identity_id}
+
+@app.post("/internal/channels/complete")
+async def complete_channel_pairing_internal(
+    payload: ChannelPairingCompleteRequest,
+    _workload: Dict[str, Any] = Depends(require_channel_gateway),
+):
+    try:
+        return IDENTITY_STORE.complete_channel_pairing_by_code(**payload.model_dump())
+    except (IdentityConflict, IdentityNotFound, IdentityRevoked) as exc:
+        raise HTTPException(status_code=404, detail="pairing is unavailable") from exc
+
+@app.post("/internal/channels/resolve")
+async def resolve_channel_binding_internal(
+    payload: ChannelBindingResolveRequest,
+    _workload: Dict[str, Any] = Depends(require_channel_gateway),
+):
+    binding = IDENTITY_STORE.resolve_channel_binding(**payload.model_dump())
+    if binding is None:
+        raise HTTPException(status_code=404, detail="channel is unavailable")
+    return binding
+
+@app.post("/internal/channels/revoke-account")
+async def revoke_channel_account_internal(
+    payload: ChannelBindingRevokeRequest,
+    _workload: Dict[str, Any] = Depends(require_channel_gateway),
+):
+    count = IDENTITY_STORE.revoke_provider_account_bindings(**payload.model_dump())
+    return {"status": "revoked", "binding_count": count}
 
 @app.post("/admin/workloads", status_code=status.HTTP_201_CREATED)
 async def create_workload(

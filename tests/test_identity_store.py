@@ -7,6 +7,7 @@ from cryptography.fernet import Fernet
 
 from identity_store import (
     IdentityConflict,
+    IdentityNotFound,
     IdentityRevoked,
     IdentityStore,
     MigrationError,
@@ -32,7 +33,7 @@ def test_bootstrap_creates_distinct_person_login_and_isolation_handles(tmp_path)
     store = make_store(tmp_path)
     identity = bootstrap(store)
     loaded = store.identity_for_login("alice-login")
-    assert store.schema_version() == 1
+    assert store.schema_version() == 2
     assert loaded["person_id"] == identity["person_id"]
     assert loaded["login_handle"] != loaded["person_id"]
     assert len({loaded["key_handle"], loaded["credential_namespace"], loaded["data_namespace"], loaded["cache_namespace"], loaded["index_namespace"]}) == 5
@@ -151,6 +152,76 @@ def test_device_and_channel_revocation_are_person_scoped(tmp_path):
     )
     assert not store.revoke_channel_identity(channel, "forged-person")
     assert store.revoke_channel_identity(channel, identity["person_id"])
+
+
+def test_telegram_pairing_requires_step_up_and_is_one_use(tmp_path):
+    store = IdentityStore(str(tmp_path / "identity.db"))
+    alice = store.bootstrap_first_person(
+        confirmed=True, login_handle="alice", display_name="Alice",
+        household_name="Household", password_hash="hash",
+    )
+    with pytest.raises(IdentityConflict, match="stronger local authentication"):
+        store.create_channel_pairing(
+            person_id=alice["person_id"], provider="telegram",
+            provider_account_id="bot-alice", local_assurance="low",
+        )
+    code, challenge = store.create_channel_pairing(
+        person_id=alice["person_id"], provider="telegram",
+        provider_account_id="bot-alice", local_assurance="passkey",
+    )
+    binding = store.complete_channel_pairing(
+        challenge_id=challenge["challenge_id"], pairing_code=code,
+        provider="telegram", provider_account_id="bot-alice", external_subject="1001",
+    )
+    assert binding["assurance"] == "low"
+    assert store.resolve_channel_binding(
+        provider="telegram", provider_account_id="bot-alice", external_subject="1001"
+    )["person_id"] == alice["person_id"]
+    with pytest.raises(IdentityNotFound, match="pairing is unavailable"):
+        store.complete_channel_pairing(
+            challenge_id=challenge["challenge_id"], pairing_code=code,
+            provider="telegram", provider_account_id="bot-alice", external_subject="1001",
+        )
+
+
+def test_wrong_person_reassignment_and_revocation_fail_closed(tmp_path):
+    store = IdentityStore(str(tmp_path / "identity.db"))
+    alice = store.bootstrap_first_person(
+        confirmed=True, login_handle="alice", display_name="Alice",
+        household_name="Household", password_hash="hash",
+    )
+    invitation, _ = store.create_invitation(
+        invited_by_person_id=alice["person_id"], household_id=alice["household_id"]
+    )
+    bob = store.accept_invitation(
+        invitation_token=invitation, login_handle="bob", display_name="Bob", password_hash="hash"
+    )
+    code, challenge = store.create_channel_pairing(
+        person_id=alice["person_id"], provider="telegram",
+        provider_account_id="bot-shared", local_assurance="high",
+    )
+    binding = store.complete_channel_pairing(
+        challenge_id=challenge["challenge_id"], pairing_code=code,
+        provider="telegram", provider_account_id="bot-shared", external_subject="1001",
+    )
+    code2, challenge2 = store.create_channel_pairing(
+        person_id=bob["person_id"], provider="telegram",
+        provider_account_id="bot-shared", local_assurance="high",
+    )
+    with pytest.raises(IdentityConflict, match="pairing is unavailable"):
+        store.complete_channel_pairing(
+            challenge_id=challenge2["challenge_id"], pairing_code=code2,
+            provider="telegram", provider_account_id="bot-shared", external_subject="1001",
+        )
+    assert not store.revoke_paired_channel(
+        channel_identity_id=binding["channel_identity_id"], person_id=bob["person_id"]
+    )
+    assert store.revoke_paired_channel(
+        channel_identity_id=binding["channel_identity_id"], person_id=alice["person_id"]
+    )
+    assert store.resolve_channel_binding(
+        provider="telegram", provider_account_id="bot-shared", external_subject="1001"
+    ) is None
 
 
 def test_workload_audience_is_narrow_and_required(tmp_path):
