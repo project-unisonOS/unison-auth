@@ -15,7 +15,7 @@ email-validator==2.1.0.post1
 cryptography==49.0.0
 
 # P0.1: Schedule for daily key rotation
-schedule==1.2.0
+schedule==1.2.2
 
 # Immutable shared contracts and principal middleware.
 unison-common @ git+https://github.com/project-unisonOS/unison-common.git@eef1a7353b2c795233daf0db6079b867ff2d98ba
