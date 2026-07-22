@@ -1117,7 +1117,8 @@ if __name__ == "__main__":
     
     uvicorn.run(
         "auth_service:app",
-        host="0.0.0.0",
+        # The containerized API must accept traffic on its published interface.
+        host="0.0.0.0",  # nosec B104
         port=8088,
         reload=True,
         log_level="info"
