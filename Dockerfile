@@ -30,6 +30,7 @@ RUN pip install --no-cache-dir --no-index /wheels/*.whl \
     && rm -rf /wheels
 
 COPY ${REPO_PATH}/src/ ./src/
+COPY ${REPO_PATH}/migrations/ ./migrations/
 RUN groupadd -r unison && useradd -r -g unison -u 1000 unison \
     && mkdir -p /keys \
     && chown -R unison:unison /app /keys
