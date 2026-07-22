@@ -8,6 +8,8 @@ def test_auth_settings_defaults(monkeypatch):
         "UNISON_AUTH_ALGORITHM",
         "UNISON_ACCESS_TOKEN_EXPIRE_MINUTES",
         "UNISON_REFRESH_TOKEN_EXPIRE_MINUTES",
+        "UNISON_AUTH_USER_STORE_PATH",
+        "UNISON_AUTH_BOOTSTRAP_TOKEN",
         "AUTH_TOKEN_RATE_LIMIT",
         "AUTH_TOKEN_RATE_WINDOW_SECONDS",
         "REDIS_HOST",
@@ -22,6 +24,8 @@ def test_auth_settings_defaults(monkeypatch):
     assert settings.algorithm == "RS256"
     assert settings.access_token_expire_minutes == 30
     assert settings.refresh_token_expire_minutes == 1440
+    assert settings.user_store_path == "/keys/users.json"
+    assert settings.bootstrap_token is None
     assert settings.rate_limit.limit == 10
     assert settings.rate_limit.window_seconds == 60
     assert settings.redis.host == "localhost"
@@ -34,6 +38,8 @@ def test_auth_settings_env_overrides(monkeypatch):
         "UNISON_AUTH_ALGORITHM": "HS512",
         "UNISON_ACCESS_TOKEN_EXPIRE_MINUTES": "45",
         "UNISON_REFRESH_TOKEN_EXPIRE_MINUTES": "60",
+        "UNISON_AUTH_USER_STORE_PATH": "/var/lib/unison-auth/users.json",
+        "UNISON_AUTH_BOOTSTRAP_TOKEN": "bootstrap-secret",
         "AUTH_TOKEN_RATE_LIMIT": "25",
         "AUTH_TOKEN_RATE_WINDOW_SECONDS": "120",
         "REDIS_HOST": "redis",
@@ -48,6 +54,8 @@ def test_auth_settings_env_overrides(monkeypatch):
     assert settings.algorithm == "HS512"
     assert settings.access_token_expire_minutes == 45
     assert settings.refresh_token_expire_minutes == 60
+    assert settings.user_store_path == "/var/lib/unison-auth/users.json"
+    assert settings.bootstrap_token == "bootstrap-secret"
     assert settings.rate_limit.limit == 25
     assert settings.rate_limit.window_seconds == 120
     assert settings.redis.host == "redis"

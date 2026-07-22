@@ -371,7 +371,11 @@ class RSAKeyManager:
         payload = jwt.decode(
             token,
             public_pem,
-            algorithms=["RS256"]
+            algorithms=["RS256"],
+            # The trust service verifies signature/session here.  Each
+            # downstream service validates its own required audience when it
+            # constructs PrincipalContext.
+            options={"verify_aud": False},
         )
         
         return payload

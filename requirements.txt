@@ -1,20 +1,21 @@
-fastapi==0.115.0
+fastapi==0.139.2
 uvicorn[standard]==0.32.0
-python-jose[cryptography]==3.3.0
+python-jose[cryptography]==3.5.0
 passlib[bcrypt]==1.7.4
-python-multipart==0.0.6
+python-multipart==0.0.32
 redis==5.0.1
 httpx==0.27.2
-pydantic==2.9.2
-python-dotenv==1.0.0
+pydantic==2.12.4
+python-dotenv==1.2.2
 
 # Needed for EmailStr in Pydantic models
 email-validator==2.1.0.post1
 
 # P0.1: RSA key management for RS256 JWT signing
-cryptography==41.0.7
+cryptography==49.0.0
 
 # P0.1: Schedule for daily key rotation
 schedule==1.2.2
 
-# unison-common package (local install)
+# Immutable shared contracts and principal middleware.
+unison-common @ git+https://github.com/project-unisonOS/unison-common.git@eef1a7353b2c795233daf0db6079b867ff2d98ba
