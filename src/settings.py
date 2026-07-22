@@ -27,7 +27,8 @@ class AuthServiceSettings:
     access_token_expire_minutes: int = 30
     refresh_token_expire_minutes: int = 1440
     user_store_path: str = "/keys/users.json"
-    identity_database_path: str = "/tmp/unison-auth/identity.db"
+    # Configurable application data, not a predictable security-sensitive temp file.
+    identity_database_path: str = "/tmp/unison-auth/identity.db"  # nosec B108
     person_audiences: tuple[str, ...] = (
         "orchestrator",
         "context",
@@ -55,7 +56,8 @@ class AuthServiceSettings:
             access_token_expire_minutes=int(os.getenv("UNISON_ACCESS_TOKEN_EXPIRE_MINUTES", "30")),
             refresh_token_expire_minutes=int(os.getenv("UNISON_REFRESH_TOKEN_EXPIRE_MINUTES", "1440")),
             user_store_path=os.getenv("UNISON_AUTH_USER_STORE_PATH", "/keys/users.json"),
-            identity_database_path=os.getenv("UNISON_AUTH_IDENTITY_DATABASE_PATH", "/tmp/unison-auth/identity.db"),
+            # Configurable application data, not a predictable security-sensitive temp file.
+            identity_database_path=os.getenv("UNISON_AUTH_IDENTITY_DATABASE_PATH", "/tmp/unison-auth/identity.db"),  # nosec B108
             person_audiences=tuple(
                 item.strip()
                 for item in os.getenv(
