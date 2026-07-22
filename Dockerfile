@@ -36,4 +36,4 @@ RUN groupadd -r unison && useradd -r -g unison -u 1000 unison \
 USER unison
 
 EXPOSE 8088
-CMD ["python", "src/auth_service.py"]
+CMD ["python", "-m", "uvicorn", "auth_service:app", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8088"]
