@@ -1,5 +1,14 @@
 # unison-auth
 
+## Phase 6 recovery authority
+
+Identity schema version 3 adds independent recovery enrollment, expiring
+replacement-device challenges, signed recovery proof, anchored-checkpoint
+validation, old-device revocation, and post-restore rotation requirements.
+Recovery secrets are never stored by the auth service. Household administrator,
+voice, and remote-channel authority cannot substitute for the person's local
+recovery proof.
+
 Authentication, token issuance, JWKS publishing, and basic user-management service for UnisonOS.
 
 ## Status
