@@ -33,7 +33,7 @@ def test_bootstrap_creates_distinct_person_login_and_isolation_handles(tmp_path)
     store = make_store(tmp_path)
     identity = bootstrap(store)
     loaded = store.identity_for_login("alice-login")
-    assert store.schema_version() == 2
+    assert store.schema_version() == 3
     assert loaded["person_id"] == identity["person_id"]
     assert loaded["login_handle"] != loaded["person_id"]
     assert len({loaded["key_handle"], loaded["credential_namespace"], loaded["data_namespace"], loaded["cache_namespace"], loaded["index_namespace"]}) == 5

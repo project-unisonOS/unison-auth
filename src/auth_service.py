@@ -207,6 +207,24 @@ class WorkloadDelegationRequest(BaseModel):
     purpose: str
     ttl_seconds: int = 300
 
+class RecoveryEnrollRequest(BaseModel):
+    recovery_public_key: str
+    capsule_digest: str
+    checkpoint: Dict[str, Any]
+    input_modality: str
+
+class RecoveryChallengeRequest(BaseModel):
+    recovery_enrollment_id: str
+    target_device_id: str
+
+class RecoveryCompleteRequest(BaseModel):
+    recovery_enrollment_id: str
+    challenge_id: str
+    target_device_id: str
+    signature: str
+    checkpoint: Dict[str, Any]
+    input_modality: str
+
 IDENTITY_STORE = IdentityStore(SETTINGS.identity_database_path)
 
 def has_admin_user() -> bool:
@@ -1057,6 +1075,55 @@ async def revoke_session(
 async def lock_current_person(current_user: Dict[str, Any] = Depends(get_current_user)):
     IDENTITY_STORE.lock_person(current_user["person_id"], "person-lock")
     return {"ok": True, "status": "locked"}
+
+@app.post("/recovery/enroll", status_code=status.HTTP_201_CREATED)
+async def enroll_recovery_authority(
+    payload: RecoveryEnrollRequest,
+    x_unison_recovery_step_up: Optional[str] = Header(
+        default=None,
+        alias="X-Unison-Recovery-Step-Up",
+    ),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        return IDENTITY_STORE.enroll_recovery_authority(
+            person_id=current_user["person_id"],
+            recovery_public_key=payload.recovery_public_key,
+            capsule_digest=payload.capsule_digest,
+            checkpoint=payload.checkpoint,
+            locally_authenticated=(x_unison_recovery_step_up == "local-high"),
+            input_modality=payload.input_modality,
+        )
+    except (IdentityConflict, IdentityNotFound) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@app.post("/recovery/challenge")
+async def issue_replacement_recovery_challenge(
+    payload: RecoveryChallengeRequest,
+):
+    try:
+        return IDENTITY_STORE.issue_recovery_challenge(
+            recovery_enrollment_id=payload.recovery_enrollment_id,
+            target_device_id=payload.target_device_id,
+        )
+    except IdentityNotFound as exc:
+        raise HTTPException(status_code=404, detail="recovery unavailable") from exc
+
+@app.post("/recovery/complete")
+async def complete_replacement_device_recovery(
+    payload: RecoveryCompleteRequest,
+):
+    try:
+        return IDENTITY_STORE.complete_replacement_device_recovery(
+            recovery_enrollment_id=payload.recovery_enrollment_id,
+            challenge_id=payload.challenge_id,
+            target_device_id=payload.target_device_id,
+            signature=payload.signature,
+            checkpoint=payload.checkpoint,
+            input_modality=payload.input_modality,
+        )
+    except (IdentityConflict, IdentityNotFound, IdentityRevoked) as exc:
+        raise HTTPException(status_code=400, detail="recovery proof rejected") from exc
 
 @app.get("/healthz", response_model=HealthResponse)
 @app.get("/health", response_model=HealthResponse)

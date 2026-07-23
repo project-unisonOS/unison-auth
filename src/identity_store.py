@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 import secrets
@@ -14,9 +15,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
-MIGRATION_VERSION = 2
+MIGRATION_VERSION = 3
 
 
 class IdentityConflict(RuntimeError):
@@ -81,7 +84,11 @@ class IdentityStore:
 
     def apply_migrations(self) -> None:
         with self.connect() as connection:
-            for version, name in ((1, "phase1_identity"), (2, "phase5_channel_pairing")):
+            for version, name in (
+                (1, "phase1_identity"),
+                (2, "phase5_channel_pairing"),
+                (3, "phase6_recovery"),
+            ):
                 script = (self.migrations_dir / f"{version:04d}_{name}.sql").read_text(encoding="utf-8")
                 connection.executescript(script)
                 connection.execute(
@@ -890,6 +897,237 @@ class IdentityStore:
         Path(run["source_path"]).write_bytes(restored)
         os.chmod(run["source_path"], 0o600)
         return {"batch_id": batch_id, "restored_path": run["source_path"]}
+
+    def enroll_recovery_authority(
+        self,
+        *,
+        person_id: str,
+        recovery_public_key: str,
+        capsule_digest: str,
+        checkpoint: dict[str, Any],
+        locally_authenticated: bool,
+        input_modality: str,
+    ) -> dict[str, Any]:
+        """Enroll person-controlled recovery without storing a recovery secret."""
+
+        if not locally_authenticated or input_modality in {"voice", "remote-channel"}:
+            raise IdentityConflict(
+                "recovery enrollment requires authenticated local non-voice input"
+            )
+        try:
+            raw_public_key = base64.urlsafe_b64decode(
+                recovery_public_key + "=" * (-len(recovery_public_key) % 4)
+            )
+            Ed25519PublicKey.from_public_bytes(raw_public_key)
+        except (ValueError, TypeError) as exc:
+            raise IdentityConflict("recovery public key is invalid") from exc
+        if len(capsule_digest) != 64:
+            raise IdentityConflict("recovery capsule digest is invalid")
+        required_checkpoint = {
+            "opaque_scope_id",
+            "sequence",
+            "manifest_digest",
+            "signer_fingerprint",
+        }
+        if not required_checkpoint.issubset(checkpoint):
+            raise IdentityConflict("recovery checkpoint is incomplete")
+        enrollment_id = new_id("recovery")
+        created_at = iso()
+        with self.transaction() as connection:
+            person = connection.execute(
+                "SELECT person_id FROM persons WHERE person_id=? AND status='active'",
+                (person_id,),
+            ).fetchone()
+            if person is None:
+                raise IdentityNotFound("person is unavailable")
+            connection.execute(
+                """
+                UPDATE recovery_enrollments
+                SET status='rotated', rotated_at=?
+                WHERE person_id=? AND status='active'
+                """,
+                (created_at, person_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO recovery_enrollments
+                (recovery_enrollment_id, person_id, recovery_public_key,
+                 capsule_digest, checkpoint_json, status, created_at)
+                VALUES (?, ?, ?, ?, ?, 'active', ?)
+                """,
+                (
+                    enrollment_id,
+                    person_id,
+                    recovery_public_key,
+                    capsule_digest,
+                    json.dumps(checkpoint, sort_keys=True),
+                    created_at,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO recovery_events VALUES (?, ?, ?, NULL, 'enroll', 'success', ?, 'local-confirmed')",
+                (new_id("revt"), person_id, enrollment_id, created_at),
+            )
+        return {
+            "recovery_enrollment_id": enrollment_id,
+            "person_id": person_id,
+            "status": "active",
+            "provider_has_recovery_secret": False,
+            "household_admin_can_recover": False,
+        }
+
+    def issue_recovery_challenge(
+        self,
+        *,
+        recovery_enrollment_id: str,
+        target_device_id: str,
+        ttl_seconds: int = 300,
+    ) -> dict[str, str]:
+        challenge_id = new_id("rch")
+        challenge = secrets.token_urlsafe(48)
+        created_at = utc_now()
+        with self.transaction() as connection:
+            enrollment = connection.execute(
+                """
+                SELECT person_id FROM recovery_enrollments
+                WHERE recovery_enrollment_id=? AND status='active'
+                """,
+                (recovery_enrollment_id,),
+            ).fetchone()
+            if enrollment is None:
+                raise IdentityNotFound("recovery enrollment is unavailable")
+            connection.execute(
+                """
+                INSERT INTO recovery_challenges
+                (challenge_id, recovery_enrollment_id, target_device_id,
+                 challenge, created_at, expires_at, consumed_at)
+                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    challenge_id,
+                    recovery_enrollment_id,
+                    target_device_id,
+                    challenge,
+                    iso(created_at),
+                    iso(created_at + timedelta(seconds=ttl_seconds)),
+                ),
+            )
+        return {
+            "challenge_id": challenge_id,
+            "challenge": challenge,
+            "target_device_id": target_device_id,
+        }
+
+    def complete_replacement_device_recovery(
+        self,
+        *,
+        recovery_enrollment_id: str,
+        challenge_id: str,
+        target_device_id: str,
+        signature: str,
+        checkpoint: dict[str, Any],
+        input_modality: str,
+    ) -> dict[str, Any]:
+        if input_modality in {"voice", "remote-channel"}:
+            raise IdentityConflict("recovery completion requires local non-voice input")
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT c.*, e.person_id, e.recovery_public_key, e.checkpoint_json
+                FROM recovery_challenges c
+                JOIN recovery_enrollments e
+                  ON e.recovery_enrollment_id=c.recovery_enrollment_id
+                WHERE c.challenge_id=? AND c.recovery_enrollment_id=?
+                  AND e.status='active'
+                """,
+                (challenge_id, recovery_enrollment_id),
+            ).fetchone()
+            if row is None or row["consumed_at"] is not None:
+                raise IdentityNotFound("recovery challenge is unavailable")
+            if row["target_device_id"] != target_device_id:
+                raise IdentityConflict("recovery target device does not match")
+            if datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00")) <= utc_now():
+                raise IdentityRevoked("recovery challenge has expired")
+            anchored = json.loads(row["checkpoint_json"])
+            if (
+                checkpoint.get("opaque_scope_id") != anchored.get("opaque_scope_id")
+                or int(checkpoint.get("sequence", 0)) < int(anchored.get("sequence", 0))
+                or (
+                    int(checkpoint.get("sequence", 0)) == int(anchored.get("sequence", 0))
+                    and checkpoint.get("manifest_digest") != anchored.get("manifest_digest")
+                )
+            ):
+                raise IdentityConflict("recovery checkpoint is rolled back or forked")
+            public_key = base64.urlsafe_b64decode(
+                row["recovery_public_key"]
+                + "=" * (-len(row["recovery_public_key"]) % 4)
+            )
+            signature_bytes = base64.urlsafe_b64decode(
+                signature + "=" * (-len(signature) % 4)
+            )
+            signed = (
+                f"unison-recovery-v1:{challenge_id}:{row['challenge']}:"
+                f"{target_device_id}:{checkpoint['manifest_digest']}"
+            ).encode()
+            try:
+                Ed25519PublicKey.from_public_bytes(public_key).verify(
+                    signature_bytes,
+                    signed,
+                )
+            except (InvalidSignature, ValueError) as exc:
+                raise IdentityConflict("recovery proof is invalid") from exc
+            recovered_at = iso()
+            connection.execute(
+                "UPDATE recovery_challenges SET consumed_at=? WHERE challenge_id=?",
+                (recovered_at, challenge_id),
+            )
+            connection.execute(
+                """
+                UPDATE device_principals
+                SET status='revoked', revoked_at=?
+                WHERE person_id=? AND status='active'
+                """,
+                (recovered_at, row["person_id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO device_principals
+                (device_principal_id, person_id, display_name, assurance,
+                 status, created_at, revoked_at)
+                VALUES (?, ?, ?, 'high', 'active', ?, NULL)
+                """,
+                (
+                    target_device_id,
+                    row["person_id"],
+                    "Replacement UnisonOS device",
+                    recovered_at,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE recovery_enrollments SET checkpoint_json=?
+                WHERE recovery_enrollment_id=?
+                """,
+                (json.dumps(checkpoint, sort_keys=True), recovery_enrollment_id),
+            )
+            connection.execute(
+                "INSERT INTO recovery_events VALUES (?, ?, ?, ?, 'replacement-device', 'success', ?, 'proof-and-anchor-verified')",
+                (
+                    new_id("revt"),
+                    row["person_id"],
+                    recovery_enrollment_id,
+                    target_device_id,
+                    recovered_at,
+                ),
+            )
+        return {
+            "person_id": row["person_id"],
+            "target_device_id": target_device_id,
+            "status": "active",
+            "old_devices_revoked": True,
+            "person_key_rotation_required": True,
+            "shared_space_rewrap_required": True,
+        }
 
 
 __all__ = [
