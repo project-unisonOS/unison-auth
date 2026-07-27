@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS wheels
+FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS wheels
 
 ARG REPO_PATH="."
 WORKDIR /build
@@ -11,7 +11,7 @@ COPY ${REPO_PATH}/constraints.txt ${REPO_PATH}/requirements.txt ./
 RUN pip wheel --no-cache-dir --wheel-dir /wheels \
     --constraint constraints.txt --requirement requirements.txt
 
-FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
