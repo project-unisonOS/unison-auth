@@ -1,12 +1,12 @@
-fastapi==0.139.2
-uvicorn[standard]==0.51.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
 python-jose[cryptography]==3.5.0
 passlib[bcrypt]==1.7.4
 python-multipart==0.0.32
 redis==5.3.1
 httpx==0.28.1
 pydantic==2.13.4
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 
 # Needed for EmailStr in Pydantic models
 email-validator==2.3.0
